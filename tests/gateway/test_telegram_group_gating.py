@@ -142,6 +142,32 @@ def _mention_entities(text, mentions):
     return [_mention_entity(text, mention) for mention in mentions]
 
 
+def test_group_mode_defaults_to_passive_observation(monkeypatch):
+    """An unconfigured group observes context but requires a direct trigger."""
+    monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv(
+        "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False
+    )
+    adapter = _make_adapter()
+
+    assert adapter._telegram_require_mention() is True
+    assert adapter._telegram_observe_unmentioned_group_messages() is True
+    assert adapter._telegram_free_response_chats() == set()
+
+
+def test_group_mode_explicit_false_overrides_passive_defaults(monkeypatch):
+    """Existing proactive deployments retain an explicit opt-out."""
+    monkeypatch.setenv("TELEGRAM_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "true")
+    adapter = _make_adapter(
+        require_mention=False,
+        observe_unmentioned_group_messages=False,
+    )
+
+    assert adapter._telegram_require_mention() is False
+    assert adapter._telegram_observe_unmentioned_group_messages() is False
+
+
 def _bot_command_entity(text, command):
     """Entity Telegram emits for a ``/cmd`` or ``/cmd@botname`` token.
 

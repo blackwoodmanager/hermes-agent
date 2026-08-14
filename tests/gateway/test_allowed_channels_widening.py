@@ -74,7 +74,8 @@ def _tg_dm_message(text="hello"):
 class TestTelegramAllowedChats:
     def test_empty_is_no_restriction(self, monkeypatch):
         monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
-        adapter = _make_telegram_adapter()
+        # Isolate allowlist semantics from the safe passive-group default.
+        adapter = _make_telegram_adapter(require_mention=False)
         assert adapter._telegram_allowed_chats() == set()
         assert adapter._should_process_message(_tg_group_message(-100)) is True
 

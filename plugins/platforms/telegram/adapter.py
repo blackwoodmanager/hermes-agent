@@ -244,12 +244,17 @@ try:
         Application,
         CommandHandler,
         CallbackQueryHandler,
-        ChatMemberHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         TypeHandler,
         filters,
     )
+    try:
+        from telegram.ext import ChatMemberHandler
+    except ImportError:
+        # Keep the core adapter importable with reduced/older SDK stubs.  The
+        # enrollment handler validates this capability when it is registered.
+        ChatMemberHandler = None
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -437,10 +442,13 @@ def check_telegram_requirements() -> bool:
         from telegram.ext import (
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
-            ChatMemberHandler as _CMH,
             MessageHandler as _MH,
             ContextTypes as _CT, filters as _filters,
         )
+        try:
+            from telegram.ext import ChatMemberHandler as _CMH
+        except ImportError:
+            _CMH = None
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
         from telegram.request import HTTPXRequest as _HR
     except ImportError:
@@ -6764,6 +6772,12 @@ class TelegramAdapter(BasePlatformAdapter):
         atomic_json_write(self._group_approval_state_path(), state, mode=0o600)
 
     def _register_group_approval_handler(self, app) -> None:
+        if ChatMemberHandler is None:
+            if self._group_approval_enabled():
+                raise RuntimeError(
+                    "Telegram group approval requires an SDK with ChatMemberHandler"
+                )
+            return
         app.add_handler(ChatMemberHandler(
             self._handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER
         ))
@@ -8954,13 +8968,17 @@ class TelegramAdapter(BasePlatformAdapter):
     # ── Group mention gating ──────────────────────────────────────────────
 
     def _telegram_require_mention(self) -> bool:
-        """Return whether group chats should require an explicit bot trigger."""
+        """Return whether group chats require an explicit bot trigger.
+
+        Passive group behavior is the safe default.  Deployments may opt out
+        explicitly through profile config or the profile-scoped environment.
+        """
         configured = self.config.extra.get("require_mention")
         if configured is not None:
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return _scoped_gate_env("TELEGRAM_REQUIRE_MENTION", "true").lower() in {"true", "1", "yes", "on"}
 
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
@@ -8977,7 +8995,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {"true", "1", "yes", "on"}
+        return _scoped_gate_env(
+            "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "true"
+        ).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
