@@ -22,6 +22,7 @@ import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -957,11 +958,42 @@ class TelegramAdapter(BasePlatformAdapter):
         (disable_notification=True) unless the caller explicitly requests a
         notification by setting ``metadata["notify"] = True``.
         """
+        if self._is_silent_after_now():
+            return {"disable_notification": True}
         if getattr(self, "_notifications_mode", "important") != "important":
             return {}
         if (metadata or {}).get("notify"):
             return {}
         return {"disable_notification": True}
+
+    def _is_silent_after_now(self, now: Optional[datetime] = None) -> bool:
+        """Whether the configured daily silent-after cutoff is active.
+
+        ``extra.silent_after`` is a local ``HH:MM`` cutoff that lasts until
+        midnight in ``extra.silent_after_timezone``. Missing or malformed
+        settings preserve the adapter's existing notification policy.
+        """
+        raw_cutoff = self.config.extra.get("silent_after")
+        if raw_cutoff is None:
+            return False
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(raw_cutoff).strip())
+        if not match:
+            return False
+        hour, minute = (int(part) for part in match.groups())
+        if hour > 23 or minute > 59:
+            return False
+        timezone_name = str(
+            self.config.extra.get("silent_after_timezone") or "UTC"
+        ).strip()
+        try:
+            local_timezone = ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            return False
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        local_current = current.astimezone(local_timezone)
+        return (local_current.hour, local_current.minute) >= (hour, minute)
 
     def _is_callback_user_authorized(
         self,
@@ -1495,8 +1527,11 @@ class TelegramAdapter(BasePlatformAdapter):
         reset_media: Optional[Any] = None,
     ) -> Any:
         """Retry stale private-topic media replies once without the topic anchor."""
+        current_kwargs = dict(send_kwargs)
+        current_kwargs.pop("disable_notification", None)
+        current_kwargs.update(self._notification_kwargs(metadata))
         try:
-            return await send_fn(**send_kwargs)
+            return await send_fn(**current_kwargs)
         except Exception as send_err:
             if not self._should_retry_without_dm_topic_reply_anchor(
                 send_err,
@@ -1513,10 +1548,12 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             if reset_media is not None:
                 reset_media()
-            retry_kwargs = dict(send_kwargs)
+            retry_kwargs = dict(current_kwargs)
             retry_kwargs["reply_to_message_id"] = None
             retry_kwargs.pop("message_thread_id", None)
             retry_kwargs.pop("direct_messages_topic_id", None)
+            retry_kwargs.pop("disable_notification", None)
+            retry_kwargs.update(self._notification_kwargs(metadata))
             return await send_fn(**retry_kwargs)
 
     def _fallback_ips(self) -> list[str]:
@@ -3654,6 +3691,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             chat_id=normalize_telegram_chat_id(chat_id),
                             message_thread_id=thread_id,
                             text=f"\U0001f4cc {topic_name}",
+                            **self._notification_kwargs(None),
                         )
                     except Exception as seed_err:
                         logger.debug(
@@ -5781,6 +5819,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             raise RuntimeError("Not connected")
 
+        # Control messages are important before the configured cutoff, but
+        # quiet hours override every caller and every notifications mode.
+        kwargs.pop("disable_notification", None)
+        kwargs.update(self._notification_kwargs({"notify": True}))
+
         message_thread_id = kwargs.get("message_thread_id")
         try:
             return await self._bot.send_message(**kwargs)
@@ -5804,6 +5847,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
+                retry_kwargs.pop("disable_notification", None)
+                retry_kwargs.update(self._notification_kwargs({"notify": True}))
                 return await self._bot.send_message(**retry_kwargs)
             raise
 
@@ -6851,7 +6896,8 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         try:
             sent = await self._bot.send_message(
-                chat_id=owner_id, text=text, reply_markup=keyboard
+                chat_id=owner_id, text=text, reply_markup=keyboard,
+                **self._notification_kwargs({"notify": True}),
             )
         except Exception as exc:
             logger.warning(
@@ -7327,6 +7373,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id=owner,
                 text="No live approved or allowlisted groups.",
                 reply_markup=None,
+                **self._notification_kwargs({"notify": True}),
             )
             return
 
@@ -7372,6 +7419,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "🚪 Выйти из группы", callback_data=f"gm:{panel_nonce}"
                 )
             ]]),
+            **self._notification_kwargs({"notify": True}),
         )
         message_id = getattr(sent, "message_id", None)
         async with lock:
@@ -9974,7 +10022,8 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await msg.reply_text(
                 f"\u26a0\ufe0f Couldn't download your {kind}{named} "
-                f"({exc.__class__.__name__}). Please try sending it again."
+                f"({exc.__class__.__name__}). Please try sending it again.",
+                **self._notification_kwargs({"notify": True}),
             )
         except Exception as reply_err:
             logger.warning(
@@ -11384,6 +11433,13 @@ async def _standalone_send(
     disable_link_previews = bool(
         getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")
     )
+    notification_adapter = TelegramAdapter(pconfig)
+    notification_kwargs_factory = lambda: notification_adapter._notification_kwargs(
+        {"notify": True}
+    )
+    disable_notification = bool(
+        notification_kwargs_factory().get("disable_notification")
+    )
     from tools.send_message_tool import _send_telegram
     return await _send_telegram(
         token,
@@ -11393,6 +11449,8 @@ async def _standalone_send(
         thread_id=thread_id,
         disable_link_previews=disable_link_previews,
         force_document=force_document,
+        disable_notification=disable_notification,
+        notification_kwargs_factory=notification_kwargs_factory,
     )
 
 

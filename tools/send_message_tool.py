@@ -187,10 +187,17 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     return None
 
 
-async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs):
+async def _send_telegram_message_with_retry(
+    bot, *, attempts: int = 3, notification_kwargs_factory=None, **kwargs
+):
     for attempt in range(attempts):
         try:
-            return await bot.send_message(**kwargs)
+            notification_kwargs = (
+                dict(notification_kwargs_factory() or {})
+                if notification_kwargs_factory
+                else {}
+            )
+            return await bot.send_message(**kwargs, **notification_kwargs)
         except Exception as exc:
             delay = _telegram_retry_delay(exc, attempt)
             if delay is None or attempt >= attempts - 1:
@@ -964,6 +971,20 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # after all text chunks.
     if platform == Platform.TELEGRAM:
         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+        disable_notification = False
+        notification_kwargs_factory = None
+        if _telegram_available:
+            from plugins.platforms.telegram.adapter import (
+                TelegramAdapter as _TelegramNotificationAdapter,
+            )
+
+            notification_adapter = _TelegramNotificationAdapter(pconfig)
+            notification_kwargs_factory = lambda: notification_adapter._notification_kwargs(
+                {"notify": True}
+            )
+            disable_notification = bool(
+                notification_kwargs_factory().get("disable_notification")
+            )
         return await _send_telegram(
             pconfig.token,
             chat_id,
@@ -972,6 +993,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            disable_notification=disable_notification,
+            notification_kwargs_factory=notification_kwargs_factory,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1299,7 +1322,17 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    disable_notification=False,
+    notification_kwargs_factory=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1387,6 +1420,14 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         # disable_web_page_preview is only valid for send_message, not
         # send_photo/send_video/etc.  Keep it separate so media sends
         # don't inherit an invalid parameter (issue #27012).
+        def _current_notification_kwargs():
+            if notification_kwargs_factory:
+                return dict(notification_kwargs_factory() or {})
+            return {"disable_notification": True} if disable_notification else {}
+
+        def _with_notification(kwargs):
+            return {**kwargs, **_current_notification_kwargs()}
+
         text_kwargs = dict(thread_kwargs)
         if disable_link_previews:
             text_kwargs["disable_web_page_preview"] = True
@@ -1427,6 +1468,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
+                        notification_kwargs_factory=_current_notification_kwargs,
                         chat_id=int_chat_id, text=chunk,
                         parse_mode=send_parse_mode, **text_kwargs
                     )
@@ -1442,6 +1484,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         text_kwargs.pop("message_thread_id", None)
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
+                            notification_kwargs_factory=_current_notification_kwargs,
                             chat_id=int_chat_id, text=chunk,
                             parse_mode=send_parse_mode, **text_kwargs
                         )
@@ -1461,6 +1504,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             plain = chunk
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
+                            notification_kwargs_factory=_current_notification_kwargs,
                             chat_id=int_chat_id, text=plain,
                             parse_mode=None, **text_kwargs
                         )
@@ -1478,7 +1522,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 if _tg_caption is not None and last_msg is None:
                     try:
                         last_msg = await _send_telegram_message_with_retry(
-                            bot, chat_id=int_chat_id, text=_tg_caption,
+                            bot,
+                            notification_kwargs_factory=_current_notification_kwargs,
+                            chat_id=int_chat_id, text=_tg_caption,
                             parse_mode=send_parse_mode, **text_kwargs
                         )
                         _tg_caption = None  # delivered — don't re-caption a later file
@@ -1511,23 +1557,23 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     try:
                         if ext in _IMAGE_EXTS and not force_document:
                             last_msg = await bot.send_photo(
-                                chat_id=int_chat_id, photo=f, **media_kwargs
+                                chat_id=int_chat_id, photo=f, **_with_notification(media_kwargs)
                             )
                         elif ext in _VIDEO_EXTS:
                             last_msg = await bot.send_video(
-                                chat_id=int_chat_id, video=f, **media_kwargs
+                                chat_id=int_chat_id, video=f, **_with_notification(media_kwargs)
                             )
                         elif ext in _VOICE_EXTS and is_voice:
                             last_msg = await bot.send_voice(
-                                chat_id=int_chat_id, voice=f, **media_kwargs
+                                chat_id=int_chat_id, voice=f, **_with_notification(media_kwargs)
                             )
                         elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
                             last_msg = await bot.send_audio(
-                                chat_id=int_chat_id, audio=f, **media_kwargs
+                                chat_id=int_chat_id, audio=f, **_with_notification(media_kwargs)
                             )
                         else:
                             last_msg = await bot.send_document(
-                                chat_id=int_chat_id, document=f, **media_kwargs
+                                chat_id=int_chat_id, document=f, **_with_notification(media_kwargs)
                             )
                     except Exception as media_err:
                         if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
@@ -1542,23 +1588,23 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             media_kwargs.pop("message_thread_id", None)
                             if ext in _IMAGE_EXTS and not force_document:
                                 last_msg = await bot.send_photo(
-                                    chat_id=int_chat_id, photo=f, **media_kwargs
+                                    chat_id=int_chat_id, photo=f, **_with_notification(media_kwargs)
                                 )
                             elif ext in _VIDEO_EXTS:
                                 last_msg = await bot.send_video(
-                                    chat_id=int_chat_id, video=f, **media_kwargs
+                                    chat_id=int_chat_id, video=f, **_with_notification(media_kwargs)
                                 )
                             elif ext in _VOICE_EXTS and is_voice:
                                 last_msg = await bot.send_voice(
-                                    chat_id=int_chat_id, voice=f, **media_kwargs
+                                    chat_id=int_chat_id, voice=f, **_with_notification(media_kwargs)
                                 )
                             elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
                                 last_msg = await bot.send_audio(
-                                    chat_id=int_chat_id, audio=f, **media_kwargs
+                                    chat_id=int_chat_id, audio=f, **_with_notification(media_kwargs)
                                 )
                             else:
                                 last_msg = await bot.send_document(
-                                    chat_id=int_chat_id, document=f, **media_kwargs
+                                    chat_id=int_chat_id, document=f, **_with_notification(media_kwargs)
                                 )
                         elif media_kwargs.get("parse_mode") and (
                             "parse" in str(media_err).lower()
@@ -1581,15 +1627,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                     pass
                             if ext in _IMAGE_EXTS and not force_document:
                                 last_msg = await bot.send_photo(
-                                    chat_id=int_chat_id, photo=f, **media_kwargs
+                                    chat_id=int_chat_id, photo=f, **_with_notification(media_kwargs)
                                 )
                             elif ext in _VIDEO_EXTS:
                                 last_msg = await bot.send_video(
-                                    chat_id=int_chat_id, video=f, **media_kwargs
+                                    chat_id=int_chat_id, video=f, **_with_notification(media_kwargs)
                                 )
                             else:
                                 last_msg = await bot.send_document(
-                                    chat_id=int_chat_id, document=f, **media_kwargs
+                                    chat_id=int_chat_id, document=f, **_with_notification(media_kwargs)
                                 )
                         else:
                             raise
