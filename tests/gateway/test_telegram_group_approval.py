@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -32,7 +34,9 @@ def _make_adapter(extra=None):
     return adapter
 
 
-def _write_pending(hermes_home, *, nonce="nonce123", message_id=9001):
+def _write_pending(
+    hermes_home, *, nonce="nonce123", message_id=9001, created_at=None
+):
     state = {
         "pending": {
             nonce: {
@@ -41,6 +45,7 @@ def _write_pending(hermes_home, *, nonce="nonce123", message_id=9001):
                 "owner_id": 171389200,
                 "owner_chat_id": 171389200,
                 "owner_message_id": message_id,
+                "created_at": created_at or datetime.now(timezone.utc).isoformat(),
             }
         },
         "rejected": {},
@@ -394,6 +399,56 @@ def test_group_approval_ignores_empty_legacy_block_when_nested_schema_is_active(
     assert target["group_allowed_chats"] == "-100111,-100222"
 
 
+def test_group_approval_ignores_field_present_empty_legacy_placeholders(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "telegram": {
+                    "allowed_chats": "",
+                    "group_allowed_chats": "",
+                    "channel_prompts": {},
+                },
+                "platforms": {
+                    "telegram": {
+                        "extra": {
+                            "allowed_chats": "-100111",
+                            "group_allowed_chats": "-100111",
+                            "channel_prompts": {"-100111": "existing prompt"},
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    adapter = _make_adapter()
+    projection = adapter._approve_telegram_group("-100222", "new prompt")
+    adapter._apply_telegram_group_runtime_projection(projection)
+
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    for target in (
+        saved["telegram"],
+        saved["platforms"]["telegram"]["extra"],
+    ):
+        assert set(target["allowed_chats"].split(",")) == {
+            "-100111", "-100222"
+        }
+        assert set(target["group_allowed_chats"].split(",")) == {
+            "-100111", "-100222"
+        }
+        assert target["channel_prompts"] == {
+            "-100111": "existing prompt",
+            "-100222": "new prompt",
+        }
+
+
 def test_group_approval_preserves_numeric_scalar_allowlists(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
@@ -554,6 +609,48 @@ async def test_replayed_or_non_pending_callback_is_rejected(tmp_path, monkeypatc
 
     query.answer.assert_awaited_once_with(text="This group request has expired")
     assert adapter._telegram_allowed_chats() == set()
+
+
+@pytest.mark.asyncio
+async def test_expired_approval_card_is_removed_without_membership_lookup(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    nonce = _write_pending(
+        hermes_home,
+        created_at="2000-01-01T00:00:00+00:00",
+    )
+    adapter = _make_adapter(
+        {
+            "group_approval_enabled": True,
+            "group_approval_owner_id": "171389200",
+            "group_approval_channel_prompt": "shared-group safety prompt",
+        }
+    )
+    query = SimpleNamespace(
+        data=f"ga:a:{nonce}",
+        message=SimpleNamespace(
+            chat_id=171389200,
+            chat=SimpleNamespace(type="private"),
+            message_id=9001,
+        ),
+        from_user=SimpleNamespace(id=171389200),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_group_approval_callback(query, query.data)
+
+    query.answer.assert_awaited_once_with(text="This group request has expired")
+    assert adapter._bot is not None
+    adapter._bot.get_chat_member.assert_not_awaited()
+    state = json.loads(
+        (hermes_home / "telegram_group_approvals.json").read_text()
+    )
+    assert nonce not in state["pending"]
+    assert state["approved"] == {}
 
 
 @pytest.mark.asyncio
@@ -895,7 +992,8 @@ def test_group_approval_uses_fresh_yaml_not_stale_runtime_allowlists(
         }
     )
 
-    adapter._approve_telegram_group("-100222", "new prompt")
+    projection = adapter._approve_telegram_group("-100222", "new prompt")
+    adapter._apply_telegram_group_runtime_projection(projection)
 
     saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))["telegram"]
     assert set(saved["allowed_chats"].split(",")) == {"-100222", "-100333"}
@@ -906,6 +1004,55 @@ def test_group_approval_uses_fresh_yaml_not_stale_runtime_allowlists(
     assert set(saved["channel_prompts"]) == {"-100222", "-100333"}
     assert adapter._telegram_allowed_chats() == {"-100222", "-100333"}
     assert adapter._telegram_group_allowed_chats() == {"-100222", "-100333"}
+
+
+@pytest.mark.asyncio
+async def test_config_io_runs_off_loop_but_runtime_projection_applies_on_loop(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    (hermes_home / "config.yaml").write_text("telegram: {}\n")
+    adapter = _make_adapter({"group_approval_enabled": True})
+    loop_thread = threading.get_ident()
+    io_thread = None
+    apply_thread = None
+    original_io = adapter._approve_telegram_group
+    original_apply = adapter._apply_telegram_group_runtime_projection
+
+    def tracked_io(chat_id, prompt):
+        nonlocal io_thread
+        io_thread = threading.get_ident()
+        return original_io(chat_id, prompt)
+
+    def tracked_apply(projection):
+        nonlocal apply_thread
+        apply_thread = threading.get_ident()
+        return original_apply(projection)
+
+    adapter._approve_telegram_group = tracked_io
+    adapter._apply_telegram_group_runtime_projection = tracked_apply
+    state = {
+        "pending": {
+            "claimed": {
+                "chat_id": "-100222",
+                "decision": "a",
+                "safety_prompt": "shared safety",
+            }
+        },
+        "approved": {},
+        "rejected": {},
+        "leave_actions": {},
+    }
+
+    await adapter._finalize_claimed_group_approval(
+        state, "claimed", state["pending"]["claimed"]
+    )
+
+    assert io_thread is not None and io_thread != loop_thread
+    assert apply_thread == loop_thread
+    assert adapter._telegram_allowed_chats() == {"-100222"}
 
 
 @pytest.mark.asyncio

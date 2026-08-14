@@ -6869,7 +6869,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             existing = next((n for n, r in state["pending"].items() if str(r.get("chat_id")) == chat_id), None)
             if existing:
-                return
+                if not self._group_approval_request_expired(
+                    state["pending"][existing]
+                ):
+                    return
+                state["pending"].pop(existing, None)
+                self._save_group_approval_state(state)
             nonce = secrets.token_urlsafe(18)
             inviter = getattr(change, "from_user", None)
             request = {
@@ -6931,7 +6936,10 @@ class TelegramAdapter(BasePlatformAdapter):
             prompt = str(request.get("safety_prompt") or "")
             if not prompt:
                 raise ValueError("Claimed approval has no persisted safety prompt")
-            await asyncio.to_thread(self._approve_telegram_group, chat_id, prompt)
+            projection = await asyncio.to_thread(
+                self._approve_telegram_group, chat_id, prompt
+            )
+            self._apply_telegram_group_runtime_projection(projection)
             self._group_approval_synchronized.add(chat_id)
             state["approved"][chat_id] = {
                 **request,
@@ -6957,6 +6965,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
             changed = False
             for nonce, request in list(state["pending"].items()):
+                if (
+                    not request.get("decision")
+                    and self._group_approval_request_expired(request)
+                ):
+                    state["pending"].pop(nonce, None)
+                    changed = True
+                    continue
                 if request.get("decision"):
                     try:
                         await self._finalize_claimed_group_approval(
@@ -7021,7 +7036,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     all_ok = False
                     continue
                 try:
-                    await asyncio.to_thread(self._approve_telegram_group, str(chat_id), prompt)
+                    projection = await asyncio.to_thread(
+                        self._approve_telegram_group, str(chat_id), prompt
+                    )
+                    self._apply_telegram_group_runtime_projection(projection)
                     prompts = self.config.extra.get("channel_prompts") or {}
                     verified = bool(
                         str(chat_id) in self._telegram_allowed_chats()
@@ -7054,7 +7072,38 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(value).strip() for value in raw if str(value).strip()}
         return {value.strip() for value in str(raw).split(",") if value.strip()}
 
-    def _approve_telegram_group(self, chat_id: str, prompt: str) -> None:
+    def _group_approval_request_expired(self, request: dict) -> bool:
+        """Fail closed for malformed, future-dated, or stale approval cards."""
+        raw_ttl = self.config.extra.get("group_approval_request_ttl_seconds", 86400)
+        try:
+            ttl = max(300.0, min(float(raw_ttl), 604800.0))
+            created = datetime.fromisoformat(
+                str(request.get("created_at") or "").replace("Z", "+00:00")
+            )
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return True
+        return age < -300.0 or age > ttl
+
+    def _apply_telegram_group_runtime_projection(self, projection) -> None:
+        """Publish a completed config projection without yielding the event loop."""
+        allowed, group_allowed, effective_prompts = projection
+        self.config.extra["allowed_chats"] = sorted(allowed)
+        self.config.extra["group_allowed_chats"] = sorted(group_allowed)
+        self.config.extra["channel_prompts"] = effective_prompts
+        os.environ["TELEGRAM_ALLOWED_CHATS"] = ",".join(sorted(allowed))
+        os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = ",".join(
+            sorted(group_allowed)
+        )
+
+    def _approve_telegram_group(self, chat_id: str, prompt: str):
+        """Persist one approval and return its completed runtime projection.
+
+        This method performs blocking file/lock work and may run in a worker
+        thread.  It must not mutate live adapter or process state there.
+        """
         if not prompt:
             raise ValueError("A group safety prompt is required")
         from hermes_constants import get_hermes_home
@@ -7102,10 +7151,17 @@ class TelegramAdapter(BasePlatformAdapter):
             precedence = root_targets + gateway_targets + platform_targets
 
             def effective(field, default):
+                empty = default
                 for target in precedence:
                     if field in target:
-                        return target.get(field)
-                return default
+                        value = target.get(field)
+                        empty = value
+                        if field == "channel_prompts":
+                            if isinstance(value, dict) and value:
+                                return value
+                        elif self._approval_allow_values(value):
+                            return value
+                return empty
 
             allowed = self._approval_allow_values(effective("allowed_chats", None))
             group_allowed = self._approval_allow_values(
@@ -7123,14 +7179,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 target["channel_prompts"] = prompts
             return allowed, group_allowed, effective_prompts
 
-        allowed, group_allowed, effective_prompts = (
-            utils.atomic_roundtrip_yaml_mutate(path, mutate, lock_timeout=5.0)
-        )
-        self.config.extra["allowed_chats"] = sorted(allowed)
-        self.config.extra["group_allowed_chats"] = sorted(group_allowed)
-        self.config.extra["channel_prompts"] = effective_prompts
-        os.environ["TELEGRAM_ALLOWED_CHATS"] = ",".join(sorted(allowed))
-        os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = ",".join(sorted(group_allowed))
+        return utils.atomic_roundtrip_yaml_mutate(path, mutate, lock_timeout=5.0)
 
     @staticmethod
     def _safe_group_link(chat) -> Optional[str]:
@@ -7276,8 +7325,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     action["owner_message_id"] = message_id
             self._save_group_approval_state(state)
 
-    def _remove_telegram_group(self, chat_id: str) -> None:
-        """Remove one exact group from every existing active routing target."""
+    def _remove_telegram_group(self, chat_id: str):
+        """Persist one removal and return its completed runtime projection."""
         from hermes_constants import get_hermes_home
         import utils
         path = get_hermes_home() / "config.yaml"
@@ -7330,19 +7379,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise ValueError("Telegram channel_prompts must be a mapping")
             return allowed, group_allowed, dict(prompts)
 
-        allowed, group_allowed, prompts = utils.atomic_roundtrip_yaml_mutate(
-            path, mutate, lock_timeout=5.0
-        )
-        self.config.extra["allowed_chats"] = sorted(allowed)
-        self.config.extra["group_allowed_chats"] = sorted(group_allowed)
-        self.config.extra["channel_prompts"] = prompts
-        os.environ["TELEGRAM_ALLOWED_CHATS"] = ",".join(sorted(allowed))
-        os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = ",".join(sorted(group_allowed))
+        return utils.atomic_roundtrip_yaml_mutate(path, mutate, lock_timeout=5.0)
 
     async def _finalize_claimed_group_leave(self, state: dict, nonce: str, action: dict) -> None:
         chat_id = str(action["chat_id"])
         if action.get("stage") != "config_cleaned":
-            await asyncio.to_thread(self._remove_telegram_group, chat_id)
+            projection = await asyncio.to_thread(
+                self._remove_telegram_group, chat_id
+            )
+            self._apply_telegram_group_runtime_projection(projection)
             action["stage"] = "config_cleaned"
             self._save_group_approval_state(state)
         try:
@@ -7453,6 +7498,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     or request.get("owner_id") != owner
                     or request.get("owner_chat_id") != owner
                     or request.get("owner_message_id") != getattr(message, "message_id", None)):
+                await query.answer(text="This group request has expired")
+                return
+            if self._group_approval_request_expired(request):
+                state["pending"].pop(nonce, None)
+                self._save_group_approval_state(state)
                 await query.answer(text="This group request has expired")
                 return
             chat_id = str(request["chat_id"])
