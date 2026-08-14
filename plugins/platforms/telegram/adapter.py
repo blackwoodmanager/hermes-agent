@@ -6748,7 +6748,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _empty_group_approval_state() -> dict:
-        return {"pending": {}, "rejected": {}, "approved": {}, "leave_actions": {}}
+        return {
+            "pending": {}, "rejected": {}, "approved": {},
+            "leave_actions": {}, "inventory_panels": {},
+        }
 
     def _load_group_approval_state(self) -> tuple[dict, bool]:
         path = self._group_approval_state_path()
@@ -6758,7 +6761,10 @@ class TelegramAdapter(BasePlatformAdapter):
             state = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(state, dict):
                 return self._empty_group_approval_state(), False
-            for section in ("pending", "rejected", "approved", "leave_actions"):
+            for section in (
+                "pending", "rejected", "approved", "leave_actions",
+                "inventory_panels",
+            ):
                 if section in state and not isinstance(state[section], dict):
                     return self._empty_group_approval_state(), False
                 state.setdefault(section, {})
@@ -6869,9 +6875,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             existing = next((n for n, r in state["pending"].items() if str(r.get("chat_id")) == chat_id), None)
             if existing:
-                if not self._group_approval_request_expired(
-                    state["pending"][existing]
-                ):
+                request = state["pending"][existing]
+                if request.get("decision"):
+                    # A durable owner decision is a claimed transaction, not an
+                    # expirable card. Keep the exact nonce/choice and resume its
+                    # idempotent finalization after this lock is released.
+                    self._schedule_group_approval_recovery(immediate=True)
+                    return
+                if not self._group_approval_request_expired(request):
                     return
                 state["pending"].pop(existing, None)
                 self._save_group_approval_state(state)
@@ -7182,30 +7193,59 @@ class TelegramAdapter(BasePlatformAdapter):
         return utils.atomic_roundtrip_yaml_mutate(path, mutate, lock_timeout=5.0)
 
     @staticmethod
-    def _safe_group_link(chat) -> Optional[str]:
+    def _safe_group_link(chat_id: str, chat) -> str:
         username = str(getattr(chat, "username", "") or "").strip().lstrip("@")
         if username and all(c.isalnum() or c == "_" for c in username):
             return f"https://t.me/{username}"
         invite = str(getattr(chat, "invite_link", "") or "").strip()
         if invite.startswith(("https://t.me/", "https://telegram.me/")):
             return invite
-        return None
+        if str(getattr(chat, "type", "")).lower() == "supergroup" and chat_id.startswith("-100"):
+            return f"https://t.me/c/{chat_id[4:]}/1"
+        return f"tg://openmessage?chat_id={chat_id}"
 
-    def _group_inventory_behavior(self, chat_id: str) -> str:
+    def _group_inventory_behavior(self, chat_id: str, title: str = "") -> str:
         prompts = self.config.extra.get("channel_prompts") or {}
         prompt = str(prompts.get(chat_id, "") if isinstance(prompts, dict) else "").strip()
+        lowered = prompt.lower()
+        title_lower = title.lower()
+        if any(term in title_lower for term in ("возврат", "повернен")):
+            return "контроль возвратов"
+        if "логист" in title_lower:
+            return "логистический ассистент"
+        if any(term in title_lower for term in ("финанс", "бухгалтер")):
+            return "финансовый ассистент"
+        if any(term in title_lower for term in ("съём", "съем", "зйом")):
+            return "координатор съёмки"
+        if any(term in title_lower for term in ("маркет", "smm", "ads", "реклам")):
+            return "маркетинговый ассистент"
+        if any(term in lowered for term in ("return/refusal", "refusal or return")):
+            return "контроль возвратов"
+        if "logistic" in lowered:
+            return "логистический ассистент"
         if chat_id in self._telegram_free_response_chats():
-            mode = "proactive"
-        elif self._telegram_require_mention():
-            mode = "mention/reply only"
-        else:
-            mode = "group intake enabled"
-        if not prompt:
-            return mode
-        concise = " ".join(prompt.split())
-        if len(concise) > 100:
-            concise = concise[:97].rstrip() + "..."
-        return f"{mode}; {concise}"
+            return "проактивный ассистент"
+        mention_only = self._telegram_require_mention() or any(
+            phrase in lowered for phrase in (
+                "only when mentioned", "only when directly mentioned",
+                "respond only when", "explicitly mentioned", "directly replied",
+            )
+        )
+        return "ассистент по обращению" if mention_only else "наблюдатель контекста"
+
+    @staticmethod
+    def _inventory_panel_matches(query, panel: dict, owner: Optional[int]) -> bool:
+        message = getattr(query, "message", None)
+        return bool(
+            owner is not None
+            and getattr(getattr(query, "from_user", None), "id", None) == owner
+            and getattr(message, "chat_id", None) == owner
+            and str(getattr(getattr(message, "chat", None), "type", "")) == "private"
+            and panel.get("status") == "active"
+            and panel.get("owner_id") == owner
+            and panel.get("owner_chat_id") == owner
+            and panel.get("owner_message_id") == getattr(message, "message_id", None)
+        )
 
     def _group_inventory_candidates(self, state: dict) -> list[str]:
         candidates = set(str(chat_id) for chat_id in state["approved"])
@@ -7248,6 +7288,13 @@ class TelegramAdapter(BasePlatformAdapter):
             state, readable = self._load_group_approval_state()
             if not readable:
                 return
+            for old_panel in state["inventory_panels"].values():
+                if old_panel.get("owner_id") == owner and old_panel.get("status") == "active":
+                    old_panel["status"] = "expired"
+            for action in state["leave_actions"].values():
+                if action.get("owner_id") == owner and action.get("status") == "pending":
+                    action["status"] = "expired"
+            self._save_group_approval_state(state)
             candidates = self._group_inventory_candidates(state)
 
         live = []
@@ -7276,54 +7323,113 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
-        actions = {}
-        lines = ["Telegram groups"]
-        rows = []
+        lines = ["<b>Группы Hermes</b>"]
+        groups = []
         for chat_id, chat, status in live:
             title = str(getattr(chat, "title", "") or f"Group {chat_id}")
-            link = self._safe_group_link(chat)
-            lines.extend([
-                "",
-                title,
-                f"chat_id: {chat_id}",
-                f"bot status: {status}",
-                f"role/behavior: {self._group_inventory_behavior(chat_id)}",
-                f"link: {link or 'unavailable'}",
-            ])
-            nonce = secrets.token_urlsafe(18)
-            actions[nonce] = {
+            link = self._safe_group_link(chat_id, chat)
+            behavior = self._group_inventory_behavior(chat_id, title)
+            lines.append(
+                f'• <a href="{_html.escape(link, quote=True)}">'
+                f'{_html.escape(title)}</a> — {_html.escape(behavior)}'
+            )
+            groups.append({
                 "chat_id": chat_id,
-                "owner_id": owner,
-                "owner_chat_id": owner,
-                "owner_message_id": None,
-                "status": "pending",
-                "created_at": datetime.now(timezone.utc).isoformat(),
                 "title": title,
-            }
-            label = title if len(title) <= 35 else title[:32].rstrip() + "..."
-            rows.append([InlineKeyboardButton(f"🚪 {label}", callback_data=f"gl:{nonce}")])
+                "link": link,
+                "behavior": behavior,
+            })
+
+        panel_nonce = secrets.token_urlsafe(18)
+        summary_text = "\n".join(lines)
+        panel = {
+            "owner_id": owner, "owner_chat_id": owner,
+            "owner_message_id": None, "status": "active",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "summary_text": summary_text, "groups": groups,
+        }
 
         async with lock:
             state, readable = self._load_group_approval_state()
             if not readable:
                 return
-            state["leave_actions"].update(actions)
+            state["inventory_panels"][panel_nonce] = panel
             self._save_group_approval_state(state)
         sent = await self._bot.send_message(
             chat_id=owner,
-            text="\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(rows),
+            text=summary_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🚪 Выйти из группы", callback_data=f"gm:{panel_nonce}"
+                )
+            ]]),
         )
         message_id = getattr(sent, "message_id", None)
         async with lock:
             state, readable = self._load_group_approval_state()
             if not readable:
                 return
-            for nonce in actions:
-                action = state["leave_actions"].get(nonce)
-                if action and action.get("status") == "pending":
-                    action["owner_message_id"] = message_id
+            saved_panel = state["inventory_panels"].get(panel_nonce)
+            if saved_panel and saved_panel.get("status") == "active":
+                saved_panel["owner_message_id"] = message_id
             self._save_group_approval_state(state)
+
+    async def _handle_group_inventory_panel_callback(self, query, data: str) -> None:
+        owner = self._group_approval_owner_id()
+        parts = data.split(":", 1)
+        panel_nonce = parts[1] if len(parts) == 2 else ""
+        lock = getattr(self, "_group_approval_lock", None) or asyncio.Lock()
+        self._group_approval_lock = lock
+        async with lock:
+            state, readable = self._load_group_approval_state()
+            panel = state["inventory_panels"].get(panel_nonce) if readable else None
+            if not panel or not self._inventory_panel_matches(query, panel, owner):
+                await query.answer(text="Это меню устарело")
+                return
+
+            if data.startswith("gb:"):
+                for action in state["leave_actions"].values():
+                    if action.get("panel_nonce") == panel_nonce and action.get("status") == "pending":
+                        action["status"] = "expired"
+                self._save_group_approval_state(state)
+                await query.answer()
+                await query.edit_message_text(
+                    text=panel["summary_text"], parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "🚪 Выйти из группы", callback_data=f"gm:{panel_nonce}"
+                        )
+                    ]]),
+                )
+                return
+
+            for action in state["leave_actions"].values():
+                if action.get("panel_nonce") == panel_nonce and action.get("status") == "pending":
+                    action["status"] = "expired"
+            rows = []
+            for group in panel.get("groups", []):
+                nonce = secrets.token_urlsafe(18)
+                state["leave_actions"][nonce] = {
+                    "chat_id": str(group["chat_id"]),
+                    "owner_id": owner, "owner_chat_id": owner,
+                    "owner_message_id": panel["owner_message_id"],
+                    "panel_nonce": panel_nonce, "status": "pending",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "title": group.get("title"),
+                }
+                title = str(group.get("title") or group["chat_id"])
+                label = title if len(title) <= 42 else title[:39].rstrip() + "..."
+                rows.append([InlineKeyboardButton(label, callback_data=f"gl:{nonce}")])
+            rows.append([InlineKeyboardButton("↩️ Назад", callback_data=f"gb:{panel_nonce}")])
+            self._save_group_approval_state(state)
+        await query.answer()
+        await query.edit_message_text(
+            text="Из какой группы выйти?",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
 
     def _remove_telegram_group(self, chat_id: str):
         """Persist one removal and return its completed runtime projection."""
@@ -7550,6 +7656,9 @@ class TelegramAdapter(BasePlatformAdapter):
         data = query.data
         if data.startswith("ga:"):
             await self._handle_group_approval_callback(query, data)
+            return
+        if data.startswith(("gm:", "gb:")):
+            await self._handle_group_inventory_panel_callback(query, data)
             return
         if data.startswith("gl:"):
             await self._handle_group_leave_callback(query, data)

@@ -62,6 +62,15 @@ def _state(home, **extra):
     return state
 
 
+def test_group_role_prefers_title_over_forbidden_terms_inside_prompt():
+    adapter = _adapter({
+        "channel_prompts": {
+            str(CHAT): "Never expose unrelated financial data; answer only when mentioned."
+        }
+    })
+    assert adapter._group_inventory_behavior(str(CHAT), "Зйомка 18.08") == "координатор съёмки"
+
+
 @pytest.fixture(autouse=True)
 def _telegram_env(monkeypatch):
     monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
@@ -88,7 +97,7 @@ async def test_groups_inventory_is_owner_private_dm_only(tmp_path, monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_groups_inventory_lists_only_live_groups_with_safe_links_and_bound_nonces(tmp_path, monkeypatch):
+async def test_groups_inventory_is_compact_linked_and_has_one_leave_menu_button(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _state(tmp_path)
     monkeypatch.setattr(
@@ -107,36 +116,37 @@ async def test_groups_inventory_lists_only_live_groups_with_safe_links_and_bound
 
     kwargs = adapter._bot.send_message.await_args.kwargs
     assert kwargs["chat_id"] == OWNER
-    assert "Operations Team" in kwargs["text"]
-    assert str(CHAT) in kwargs["text"]
-    assert "administrator" in kwargs["text"]
-    assert "https://t.me/operations_team" in kwargs["text"]
-    assert "mentioned" in kwargs["text"]
+    assert kwargs["parse_mode"] == "HTML"
+    assert '<a href="https://t.me/operations_team">Operations Team</a>' in kwargs["text"]
+    assert str(CHAT) not in kwargs["text"]
+    assert "administrator" not in kwargs["text"]
+    assert "ассистент по обращению" in kwargs["text"]
     rows = kwargs["reply_markup"].inline_keyboard
     assert len(rows) == 1
-    assert rows[0][0].text.startswith("🚪 Operations Team")
-    assert rows[0][0].callback_data.startswith("gl:")
-    assert str(CHAT) not in rows[0][0].callback_data
-    nonce = rows[0][0].callback_data.split(":", 1)[1]
+    assert rows[0][0].text == "🚪 Выйти из группы"
+    assert rows[0][0].callback_data.startswith("gm:")
+    panel_nonce = rows[0][0].callback_data.split(":", 1)[1]
     saved = json.loads((tmp_path / "telegram_group_approvals.json").read_text())
-    assert saved["leave_actions"][nonce]["owner_id"] == OWNER
-    assert saved["leave_actions"][nonce]["owner_chat_id"] == OWNER
-    assert saved["leave_actions"][nonce]["owner_message_id"] == 444
-    assert saved["leave_actions"][nonce]["chat_id"] == str(CHAT)
-    assert saved["leave_actions"][nonce]["status"] == "pending"
+    assert saved["leave_actions"] == {}
+    panel = saved["inventory_panels"][panel_nonce]
+    assert panel["owner_id"] == OWNER
+    assert panel["owner_chat_id"] == OWNER
+    assert panel["owner_message_id"] == 444
+    assert panel["status"] == "active"
+    assert panel["groups"][0]["chat_id"] == str(CHAT)
 
 
 @pytest.mark.asyncio
-async def test_groups_inventory_states_link_unavailable_and_skips_departed_bot(tmp_path, monkeypatch):
+async def test_groups_inventory_uses_basic_group_desktop_deep_link_and_skips_departed_bot(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _state(tmp_path)
     adapter = _adapter()
     adapter._bot.get_chat.return_value = SimpleNamespace(
-        id=CHAT, title="Private Team", username=None, invite_link=None
+        id=CHAT, type="group", title="Private Team", username=None, invite_link=None
     )
 
     await adapter._handle_groups_command(SimpleNamespace(effective_message=_message()), None)
-    assert "link: unavailable" in adapter._bot.send_message.await_args.kwargs["text"].lower()
+    assert 'href="tg://openmessage?chat_id=-100222"' in adapter._bot.send_message.await_args.kwargs["text"]
 
     adapter._bot.reset_mock()
     adapter._bot.get_chat_member.return_value = SimpleNamespace(status="left")
@@ -166,7 +176,7 @@ async def test_groups_inventory_uses_existing_safe_invite_but_rejects_unsafe_lin
     _state(tmp_path)
     adapter = _adapter()
     adapter._bot.get_chat.return_value = SimpleNamespace(
-        id=CHAT, title="Private Team", username=None,
+        id=CHAT, type="supergroup", title="Private Team", username=None,
         invite_link="https://t.me/+existingInvite",
     )
     await adapter._handle_groups_command(SimpleNamespace(effective_message=_message()), None)
@@ -174,11 +184,173 @@ async def test_groups_inventory_uses_existing_safe_invite_but_rejects_unsafe_lin
 
     adapter._bot.reset_mock()
     adapter._bot.get_chat.return_value = SimpleNamespace(
-        id=CHAT, title="Private Team", username=None,
+        id=CHAT, type="supergroup", title="Private Team", username=None,
         invite_link="javascript:alert(1)",
     )
     await adapter._handle_groups_command(SimpleNamespace(effective_message=_message()), None)
-    assert "link: unavailable" in adapter._bot.send_message.await_args.kwargs["text"]
+    assert 'href="https://t.me/c/222/1"' in adapter._bot.send_message.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_leave_menu_button_opens_group_picker_with_fresh_bound_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _state(tmp_path)
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+        lambda text, callback_data: SimpleNamespace(text=text, callback_data=callback_data),
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+        lambda rows: SimpleNamespace(inline_keyboard=rows),
+    )
+    adapter = _adapter()
+    await adapter._handle_groups_command(SimpleNamespace(effective_message=_message()), None)
+    command_markup = adapter._bot.send_message.await_args.kwargs["reply_markup"]
+    panel_data = command_markup.inline_keyboard[0][0].callback_data
+    panel_nonce = panel_data.split(":", 1)[1]
+    query = SimpleNamespace(
+        data=panel_data,
+        from_user=SimpleNamespace(id=OWNER),
+        message=SimpleNamespace(
+            chat_id=OWNER, message_id=444,
+            chat=SimpleNamespace(id=OWNER, type="private"),
+        ),
+        answer=AsyncMock(), edit_message_text=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+
+    query.answer.assert_awaited_once()
+    picker = query.edit_message_text.await_args.kwargs
+    assert picker["text"] == "Из какой группы выйти?"
+    rows = picker["reply_markup"].inline_keyboard
+    assert rows[0][0].text == "Operations Team"
+    assert rows[0][0].callback_data.startswith("gl:")
+    assert rows[-1][0].text == "↩️ Назад"
+    assert rows[-1][0].callback_data == f"gb:{panel_nonce}"
+    leave_nonce = rows[0][0].callback_data.split(":", 1)[1]
+    saved = json.loads((tmp_path / "telegram_group_approvals.json").read_text())
+    action = saved["leave_actions"][leave_nonce]
+    assert action["owner_id"] == OWNER
+    assert action["owner_chat_id"] == OWNER
+    assert action["owner_message_id"] == 444
+    assert action["chat_id"] == str(CHAT)
+    assert action["status"] == "pending"
+
+    back = SimpleNamespace(
+        data=f"gb:{panel_nonce}",
+        from_user=SimpleNamespace(id=OWNER),
+        message=query.message,
+        answer=AsyncMock(), edit_message_text=AsyncMock(),
+    )
+    await adapter._handle_callback_query(SimpleNamespace(callback_query=back), None)
+    restored = back.edit_message_text.await_args.kwargs
+    assert restored["parse_mode"] == "HTML"
+    assert "Operations Team" in restored["text"]
+    assert restored["reply_markup"].inline_keyboard[0][0].text == "🚪 Выйти из группы"
+    saved = json.loads((tmp_path / "telegram_group_approvals.json").read_text())
+    assert saved["leave_actions"][leave_nonce]["status"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_leave_menu_rejects_wrong_owner_and_wrong_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state = _state(tmp_path)
+    state["inventory_panels"] = {
+        "panel": {
+            "owner_id": OWNER, "owner_chat_id": OWNER,
+            "owner_message_id": 444, "status": "active", "groups": [],
+            "summary_text": "summary",
+        }
+    }
+    (tmp_path / "telegram_group_approvals.json").write_text(json.dumps(state))
+    adapter = _adapter()
+    for user_id, message_id in ((999, 444), (OWNER, 445)):
+        query = SimpleNamespace(
+            data="gm:panel", from_user=SimpleNamespace(id=user_id),
+            message=SimpleNamespace(
+                chat_id=OWNER, message_id=message_id,
+                chat=SimpleNamespace(id=OWNER, type="private"),
+            ),
+            answer=AsyncMock(), edit_message_text=AsyncMock(),
+        )
+        await adapter._handle_callback_query(SimpleNamespace(callback_query=query), None)
+        query.answer.assert_awaited_once_with(text="Это меню устарело")
+        query.edit_message_text.assert_not_awaited()
+    saved = json.loads((tmp_path / "telegram_group_approvals.json").read_text())
+    assert saved["leave_actions"] == {}
+
+
+@pytest.mark.asyncio
+async def test_reopening_picker_expires_old_leave_nonce(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state = _state(tmp_path)
+    state["inventory_panels"] = {
+        "panel": {
+            "owner_id": OWNER, "owner_chat_id": OWNER,
+            "owner_message_id": 444, "status": "active",
+            "groups": [{"chat_id": str(CHAT), "title": "Operations Team"}],
+            "summary_text": "summary",
+        }
+    }
+    (tmp_path / "telegram_group_approvals.json").write_text(json.dumps(state))
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+        lambda text, callback_data: SimpleNamespace(text=text, callback_data=callback_data),
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+        lambda rows: SimpleNamespace(inline_keyboard=rows),
+    )
+    adapter = _adapter()
+    query = SimpleNamespace(
+        data="gm:panel", from_user=SimpleNamespace(id=OWNER),
+        message=SimpleNamespace(
+            chat_id=OWNER, message_id=444,
+            chat=SimpleNamespace(id=OWNER, type="private"),
+        ),
+        answer=AsyncMock(), edit_message_text=AsyncMock(),
+    )
+    await adapter._handle_group_inventory_panel_callback(query, query.data)
+    first_data = query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+    await adapter._handle_group_inventory_panel_callback(query, query.data)
+    second_data = query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+    assert first_data != second_data
+    saved = json.loads((tmp_path / "telegram_group_approvals.json").read_text())
+    assert saved["leave_actions"][first_data.split(":", 1)[1]]["status"] == "expired"
+    assert saved["leave_actions"][second_data.split(":", 1)[1]]["status"] == "pending"
+
+    old = _leave_query(first_data.split(":", 1)[1])
+    await adapter._handle_group_leave_callback(old, first_data)
+    adapter._bot.leave_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_inventory_refresh_expires_previous_panel_and_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    state = _state(tmp_path)
+    state["inventory_panels"] = {
+        "old": {
+            "owner_id": OWNER, "owner_chat_id": OWNER,
+            "owner_message_id": 444, "status": "active",
+        }
+    }
+    state["leave_actions"] = {
+        "old-action": {
+            "chat_id": str(CHAT), "owner_id": OWNER,
+            "owner_chat_id": OWNER, "owner_message_id": 444,
+            "status": "pending", "panel_nonce": "old",
+        }
+    }
+    (tmp_path / "telegram_group_approvals.json").write_text(json.dumps(state))
+    adapter = _adapter()
+    adapter._bot.get_chat_member.return_value = SimpleNamespace(status="left")
+
+    await adapter._handle_groups_command(SimpleNamespace(effective_message=_message()), None)
+
+    saved = json.loads((tmp_path / "telegram_group_approvals.json").read_text())
+    assert saved["inventory_panels"]["old"]["status"] == "expired"
+    assert saved["leave_actions"]["old-action"]["status"] == "expired"
 
 
 def _write_config(home):

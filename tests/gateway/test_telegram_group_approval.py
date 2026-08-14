@@ -235,6 +235,70 @@ async def test_new_group_membership_requests_owner_approval(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["a", "d"])
+async def test_membership_reissue_preserves_expired_claim_and_schedules_recovery(
+    tmp_path, monkeypatch, decision
+):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    (hermes_home / "config.yaml").write_text("telegram: {}\n", encoding="utf-8")
+    claimed = {
+        "chat_id": "-100222",
+        "title": "New Team",
+        "owner_id": 171389200,
+        "owner_chat_id": 171389200,
+        "owner_message_id": 9001,
+        "created_at": "2000-01-01T00:00:00+00:00",
+        "decision": decision,
+        "safety_prompt": "persisted safety prompt",
+    }
+    state = {
+        "pending": {"claimed-nonce": claimed},
+        "rejected": {},
+        "approved": {},
+        "leave_actions": {},
+        "inventory_panels": {},
+    }
+    (hermes_home / "telegram_group_approvals.json").write_text(
+        json.dumps(state), encoding="utf-8"
+    )
+    adapter = _make_adapter(
+        {
+            "group_approval_enabled": True,
+            "group_approval_owner_id": "171389200",
+        }
+    )
+    adapter._schedule_group_approval_recovery = Mock()
+    update = SimpleNamespace(
+        my_chat_member=SimpleNamespace(
+            chat=SimpleNamespace(
+                id=-100222, type="supergroup", title="New Team"
+            ),
+            new_chat_member=SimpleNamespace(status="administrator"),
+            from_user=SimpleNamespace(id=555, full_name="Inviter"),
+        )
+    )
+
+    await adapter._handle_my_chat_member(update, SimpleNamespace())
+
+    adapter._bot.send_message.assert_not_awaited()
+    adapter._schedule_group_approval_recovery.assert_called_once_with(immediate=True)
+    retained = json.loads(
+        (hermes_home / "telegram_group_approvals.json").read_text(encoding="utf-8")
+    )
+    assert retained["pending"] == {"claimed-nonce": claimed}
+
+    assert await adapter._recover_pending_group_approvals() is False
+    recovered = json.loads(
+        (hermes_home / "telegram_group_approvals.json").read_text(encoding="utf-8")
+    )
+    assert recovered["pending"] == {}
+    target = "approved" if decision == "a" else "rejected"
+    assert recovered[target]["-100222"]["decision"] == decision
+
+
+@pytest.mark.asyncio
 async def test_owner_approval_persists_and_activates_group(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
