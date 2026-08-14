@@ -16,6 +16,7 @@ import logging
 import os
 import html as _html
 import re
+import secrets
 import threading
 import time
 from contextvars import ContextVar
@@ -243,6 +244,7 @@ try:
         Application,
         CommandHandler,
         CallbackQueryHandler,
+        ChatMemberHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         TypeHandler,
@@ -262,6 +264,7 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
+    ChatMemberHandler = Any
     TypeHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
@@ -415,7 +418,7 @@ def check_telegram_requirements() -> bool:
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
-    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global CommandHandler, CallbackQueryHandler, ChatMemberHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
@@ -434,6 +437,7 @@ def check_telegram_requirements() -> bool:
         from telegram.ext import (
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
+            ChatMemberHandler as _CMH,
             MessageHandler as _MH,
             ContextTypes as _CT, filters as _filters,
         )
@@ -450,6 +454,7 @@ def check_telegram_requirements() -> bool:
     Application = _App
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
+    ChatMemberHandler = _CMH
     TelegramMessageHandler = _MH
     ContextTypes = _CT
     filters = _filters
@@ -723,6 +728,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
+        self._group_approval_lock = asyncio.Lock()
+        self._group_approval_retry_tasks: set[asyncio.Task] = set()
+        self._group_approval_retry_delays = (1.0, 3.0, 10.0)
+        # Durable approvals are not trusted until their exact allowlists and
+        # mandatory prompt have been projected into the live adapter config.
+        self._group_approval_synchronized: set[str] = set()
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
@@ -3786,6 +3797,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # callback means no trusted auth boundary, so fail closed.
         try:
             source = self._source_for_platform_event_auth(update)
+            if not self._group_approval_allows_source(source):
+                return
             await handler(event, source)
         except Exception:
             logger.debug("[%s] gateway_platform_event dispatch error", self.name, exc_info=True)
@@ -3945,6 +3958,8 @@ class TelegramAdapter(BasePlatformAdapter):
         the ``gateway_platform_event`` observer (group 99) in lockstep with the
         core handlers.
         """
+        self._register_group_approval_handler(app)
+        app.add_handler(CommandHandler("groups", self._handle_groups_command))
         app.add_handler(TelegramMessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self._handle_text_message
@@ -4302,6 +4317,10 @@ class TelegramAdapter(BasePlatformAdapter):
                             await _shutdown_abandoned_app(old_app)
                         except Exception:
                             pass
+            # Rebuild every durable approval's exact allowlist + mandatory
+            # prompt projection before polling/webhook intake can begin.
+            if self._group_approval_enabled():
+                await self._rehydrate_approved_groups()
             await self._app.start()
 
             # Decide between webhook and polling mode
@@ -4477,6 +4496,8 @@ class TelegramAdapter(BasePlatformAdapter):
             # cancellable background task so connect() returns as soon as the
             # transport is up.
             self._start_post_connect_housekeeping()
+            if self._group_approval_enabled():
+                self._schedule_group_approval_recovery(immediate=True)
 
             return True
             
@@ -4634,6 +4655,17 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
         self._send_path_degraded = True
+
+        approval_tasks = list(getattr(self, "_group_approval_retry_tasks", set()))
+        for task in approval_tasks:
+            task.cancel()
+        if approval_tasks:
+            await self._await_disconnect_step(
+                asyncio.gather(*approval_tasks, return_exceptions=True),
+                _DISCONNECT_STEP_TIMEOUT,
+                "group-approval retry-task cancel",
+            )
+        getattr(self, "_group_approval_retry_tasks", set()).clear()
 
         # Release the bot-token lock immediately so a wedged close cannot block
         # the reconnect watcher from acquiring it (#80598). The rest of teardown
@@ -6688,6 +6720,762 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Owner-approved group enrollment
+    # ------------------------------------------------------------------
+
+    def _group_approval_enabled(self) -> bool:
+        value = self.config.extra.get("group_approval_enabled", False)
+        return value is True or str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _group_approval_owner_id(self) -> Optional[int]:
+        try:
+            return int(self.config.extra.get("group_approval_owner_id"))
+        except (TypeError, ValueError):
+            return None
+
+    def _group_approval_state_path(self):
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "telegram_group_approvals.json"
+
+    @staticmethod
+    def _empty_group_approval_state() -> dict:
+        return {"pending": {}, "rejected": {}, "approved": {}, "leave_actions": {}}
+
+    def _load_group_approval_state(self) -> tuple[dict, bool]:
+        path = self._group_approval_state_path()
+        if not path.exists():
+            return self._empty_group_approval_state(), True
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                return self._empty_group_approval_state(), False
+            for section in ("pending", "rejected", "approved", "leave_actions"):
+                if section in state and not isinstance(state[section], dict):
+                    return self._empty_group_approval_state(), False
+                state.setdefault(section, {})
+            return state, True
+        except (OSError, ValueError, TypeError):
+            logger.error("[Telegram] Group approval state is unreadable", exc_info=True)
+            return self._empty_group_approval_state(), False
+
+    def _save_group_approval_state(self, state: dict) -> None:
+        from utils import atomic_json_write
+        atomic_json_write(self._group_approval_state_path(), state, mode=0o600)
+
+    def _register_group_approval_handler(self, app) -> None:
+        app.add_handler(ChatMemberHandler(
+            self._handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER
+        ))
+
+    def _is_effectively_approved_group(self, chat_id: str) -> bool:
+        if not self._group_approval_enabled():
+            return True
+        state, readable = self._load_group_approval_state()
+        if not readable:
+            return False
+        chat_id = str(chat_id)
+        if chat_id in state["rejected"]:
+            return False
+        if any(str(item.get("chat_id")) == chat_id for item in state["pending"].values()):
+            return False
+        allowed = (
+            chat_id in self._telegram_allowed_chats()
+            and chat_id in self._telegram_group_allowed_chats()
+        )
+        approved = state["approved"].get(chat_id)
+        if approved is not None:
+            prompts = self.config.extra.get("channel_prompts") or {}
+            projected_prompt = prompts.get(chat_id) if isinstance(prompts, dict) else None
+            return bool(
+                allowed
+                and approved.get("synchronized") is True
+                and chat_id in self._group_approval_synchronized
+                and projected_prompt
+                and projected_prompt == approved.get("safety_prompt")
+            )
+        return allowed
+
+    def _group_approval_allows_message(self, message) -> bool:
+        if not self._is_group_chat(message):
+            return True
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        return self._is_effectively_approved_group(chat_id)
+
+    def _group_approval_allows_source(self, source) -> bool:
+        chat_type = str(getattr(source, "chat_type", "")).lower()
+        if chat_type not in {"group", "supergroup", "channel"}:
+            return True
+        return self._is_effectively_approved_group(str(getattr(source, "chat_id", "")))
+
+    async def _deliver_group_approval_request(self, nonce: str, request: dict) -> bool:
+        owner_id = self._group_approval_owner_id()
+        if owner_id is None or not self._bot:
+            return False
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅", callback_data=f"ga:a:{nonce}"),
+            InlineKeyboardButton("❌", callback_data=f"ga:d:{nonce}"),
+        ]])
+        text = (
+            "Додано в нову Telegram-групу\n"
+            f"Група: {request.get('title') or '(без назви)'}\n"
+            f"Chat ID: {request['chat_id']}\n\n"
+            "Підтверджуєте участь Hermes і доступ до повідомлень?"
+        )
+        try:
+            sent = await self._bot.send_message(
+                chat_id=owner_id, text=text, reply_markup=keyboard
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Telegram] Could not notify group approval owner: %s",
+                _redact_telegram_error_text(exc),
+            )
+            return False
+        request["owner_message_id"] = getattr(sent, "message_id", None)
+        return request["owner_message_id"] is not None
+
+    async def _handle_my_chat_member(self, update, context) -> None:
+        if not self._group_approval_enabled():
+            return
+        change = getattr(update, "my_chat_member", None)
+        chat = getattr(change, "chat", None)
+        status = str(getattr(getattr(change, "new_chat_member", None), "status", "")).lower()
+        chat_type = str(getattr(chat, "type", "")).lower()
+        if not chat or chat_type not in {"group", "supergroup"} or status not in {"member", "administrator"}:
+            return
+        chat_id = str(chat.id)
+        lock = getattr(self, "_group_approval_lock", None) or asyncio.Lock()
+        self._group_approval_lock = lock
+        async with lock:
+            state, readable = self._load_group_approval_state()
+            if not readable or chat_id in state["rejected"] or chat_id in state["approved"]:
+                return
+            if chat_id in self._telegram_allowed_chats() and chat_id in self._telegram_group_allowed_chats():
+                return
+            existing = next((n for n, r in state["pending"].items() if str(r.get("chat_id")) == chat_id), None)
+            if existing:
+                return
+            nonce = secrets.token_urlsafe(18)
+            inviter = getattr(change, "from_user", None)
+            request = {
+                "chat_id": chat_id,
+                "title": getattr(chat, "title", None),
+                "chat_type": chat_type,
+                "owner_id": self._group_approval_owner_id(),
+                "owner_chat_id": self._group_approval_owner_id(),
+                "inviter_id": getattr(inviter, "id", None),
+                "inviter_name": getattr(inviter, "full_name", None),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "owner_message_id": None,
+            }
+            state["pending"][nonce] = request
+            self._save_group_approval_state(state)
+            delivered = await self._deliver_group_approval_request(nonce, request)
+            if delivered:
+                try:
+                    self._save_group_approval_state(state)
+                except Exception:
+                    logger.exception(
+                        "[Telegram] Could not persist owner notification delivery"
+                    )
+                    self._schedule_group_approval_recovery()
+            else:
+                self._schedule_group_approval_recovery()
+
+    def _schedule_group_approval_recovery(self, *, immediate: bool = False) -> None:
+        current = asyncio.current_task()
+        if any(
+            not task.done() and task is not current
+            for task in self._group_approval_retry_tasks
+        ):
+            return
+        task = asyncio.create_task(self._run_group_approval_recovery(immediate))
+        self._group_approval_retry_tasks.add(task)
+        task.add_done_callback(self._group_approval_retry_tasks.discard)
+
+    async def _run_group_approval_recovery(self, immediate: bool) -> None:
+        needs_retry = True
+        if immediate:
+            needs_retry = await self._recover_pending_group_approvals()
+        for delay in self._group_approval_retry_delays:
+            if not needs_retry:
+                return
+            await asyncio.sleep(delay)
+            needs_retry = await self._recover_pending_group_approvals()
+        if needs_retry:
+            logger.warning(
+                "[Telegram] Group approval recovery exhausted bounded retries"
+            )
+
+    async def _finalize_claimed_group_approval(
+        self, state: dict, nonce: str, request: dict
+    ) -> None:
+        chat_id = str(request["chat_id"])
+        choice = request.get("decision")
+        if choice == "a":
+            prompt = str(request.get("safety_prompt") or "")
+            if not prompt:
+                raise ValueError("Claimed approval has no persisted safety prompt")
+            await asyncio.to_thread(self._approve_telegram_group, chat_id, prompt)
+            self._group_approval_synchronized.add(chat_id)
+            state["approved"][chat_id] = {
+                **request,
+                "safety_prompt": prompt,
+                "synchronized": True,
+                "approved_at": request.get("approved_at")
+                or datetime.now(timezone.utc).isoformat(),
+            }
+        elif choice == "d":
+            state["rejected"][chat_id] = request
+        else:
+            raise ValueError("Invalid claimed group approval decision")
+        state["pending"].pop(nonce, None)
+        self._save_group_approval_state(state)
+
+    async def _recover_pending_group_approvals(self) -> bool:
+        needs_retry = False
+        lock = getattr(self, "_group_approval_lock", None) or asyncio.Lock()
+        self._group_approval_lock = lock
+        async with lock:
+            state, readable = self._load_group_approval_state()
+            if not readable:
+                return False
+            changed = False
+            for nonce, request in list(state["pending"].items()):
+                if request.get("decision"):
+                    try:
+                        await self._finalize_claimed_group_approval(
+                            state, nonce, request
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[Telegram] Claimed group approval recovery failed"
+                        )
+                        needs_retry = True
+                    continue
+                if request.get("owner_message_id") is None:
+                    if await self._deliver_group_approval_request(nonce, request):
+                        changed = True
+                    else:
+                        needs_retry = True
+            if changed:
+                try:
+                    self._save_group_approval_state(state)
+                except Exception:
+                    logger.exception(
+                        "[Telegram] Could not persist recovered owner notification"
+                    )
+                    needs_retry = True
+            for nonce, action in list(state["leave_actions"].items()):
+                if action.get("status") != "claimed":
+                    continue
+                try:
+                    await self._finalize_claimed_group_leave(state, nonce, action)
+                except Exception as exc:
+                    logger.error(
+                        "[Telegram] Claimed group leave recovery failed: %s",
+                        _redact_telegram_error_text(exc),
+                    )
+                    needs_retry = True
+        return needs_retry
+
+    async def _rehydrate_approved_groups(self) -> bool:
+        """Project durable approvals before intake; failures stay blocked."""
+        self._group_approval_synchronized.clear()
+        lock = getattr(self, "_group_approval_lock", None) or asyncio.Lock()
+        self._group_approval_lock = lock
+        async with lock:
+            state, readable = self._load_group_approval_state()
+            if not readable:
+                return False
+            changed = False
+            all_ok = True
+            for chat_id, record in state["approved"].items():
+                # Older production approvals stored the mandatory prompt under
+                # ``prompt``.  Migrate it in place before fail-closed
+                # synchronization so upgrading does not strand every existing
+                # approved group while still requiring an explicit prompt.
+                prompt = str(
+                    record.get("safety_prompt") or record.get("prompt") or ""
+                )
+                if prompt and record.get("safety_prompt") != prompt:
+                    record["safety_prompt"] = prompt
+                record["synchronized"] = False
+                changed = True
+                if not prompt:
+                    all_ok = False
+                    continue
+                try:
+                    await asyncio.to_thread(self._approve_telegram_group, str(chat_id), prompt)
+                    prompts = self.config.extra.get("channel_prompts") or {}
+                    verified = bool(
+                        str(chat_id) in self._telegram_allowed_chats()
+                        and str(chat_id) in self._telegram_group_allowed_chats()
+                        and isinstance(prompts, dict)
+                        and prompts.get(str(chat_id)) == prompt
+                    )
+                except Exception:
+                    logger.exception("[Telegram] Approved group rehydration failed")
+                    verified = False
+                if verified:
+                    record["synchronized"] = True
+                    self._group_approval_synchronized.add(str(chat_id))
+                else:
+                    all_ok = False
+            if changed:
+                try:
+                    self._save_group_approval_state(state)
+                except Exception:
+                    self._group_approval_synchronized.clear()
+                    logger.exception("[Telegram] Could not persist approval synchronization")
+                    return False
+            return all_ok
+
+    @staticmethod
+    def _approval_allow_values(raw) -> set[str]:
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set)):
+            return {str(value).strip() for value in raw if str(value).strip()}
+        return {value.strip() for value in str(raw).split(",") if value.strip()}
+
+    def _approve_telegram_group(self, chat_id: str, prompt: str) -> None:
+        if not prompt:
+            raise ValueError("A group safety prompt is required")
+        from hermes_constants import get_hermes_home
+        import utils
+        path = get_hermes_home() / "config.yaml"
+
+        def mutate(document):
+            telegram = document.get("telegram")
+            platform = (
+                (document.get("platforms") or {}).get("telegram")
+                if isinstance(document.get("platforms"), dict)
+                else None
+            )
+            gateway = document.get("gateway")
+            gateway_platform = None
+            if isinstance(gateway, dict) and isinstance(gateway.get("platforms"), dict):
+                gateway_platform = gateway["platforms"].get("telegram")
+
+            def routing_targets(block):
+                if not isinstance(block, dict):
+                    return []
+                targets = [block]
+                if isinstance(block.get("extra"), dict):
+                    targets.append(block["extra"])
+                return targets
+
+            root_targets = routing_targets(telegram)
+            platform_targets = routing_targets(platform)
+            gateway_targets = routing_targets(gateway_platform)
+            all_targets = root_targets + platform_targets + gateway_targets
+            fields = ("allowed_chats", "group_allowed_chats", "channel_prompts")
+            active = [target for target in all_targets if any(k in target for k in fields)]
+            if not active:
+                existing_blocks = root_targets + platform_targets + gateway_targets
+                active = existing_blocks[-1:] if existing_blocks else []
+            if not active:
+                document["telegram"] = {}
+                root_targets = [document["telegram"]]
+                active = root_targets
+
+            # Resolve each field from the freshest YAML using the loader's
+            # field precedence: top-level Telegram first, then the gateway
+            # fallback before platforms.telegram. Never union dormant lower-
+            # precedence allowlists: doing so would expand authorization.
+            precedence = root_targets + gateway_targets + platform_targets
+
+            def effective(field, default):
+                for target in precedence:
+                    if field in target:
+                        return target.get(field)
+                return default
+
+            allowed = self._approval_allow_values(effective("allowed_chats", None))
+            group_allowed = self._approval_allow_values(
+                effective("group_allowed_chats", None)
+            )
+            effective_prompts = dict(effective("channel_prompts", {}) or {})
+            allowed.add(str(chat_id))
+            group_allowed.add(str(chat_id))
+            effective_prompts[str(chat_id)] = prompt
+            for target in active:
+                prompts = dict(target.get("channel_prompts") or {})
+                prompts.update(effective_prompts)
+                target["allowed_chats"] = ",".join(sorted(allowed))
+                target["group_allowed_chats"] = ",".join(sorted(group_allowed))
+                target["channel_prompts"] = prompts
+            return allowed, group_allowed, effective_prompts
+
+        allowed, group_allowed, effective_prompts = (
+            utils.atomic_roundtrip_yaml_mutate(path, mutate, lock_timeout=5.0)
+        )
+        self.config.extra["allowed_chats"] = sorted(allowed)
+        self.config.extra["group_allowed_chats"] = sorted(group_allowed)
+        self.config.extra["channel_prompts"] = effective_prompts
+        os.environ["TELEGRAM_ALLOWED_CHATS"] = ",".join(sorted(allowed))
+        os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = ",".join(sorted(group_allowed))
+
+    @staticmethod
+    def _safe_group_link(chat) -> Optional[str]:
+        username = str(getattr(chat, "username", "") or "").strip().lstrip("@")
+        if username and all(c.isalnum() or c == "_" for c in username):
+            return f"https://t.me/{username}"
+        invite = str(getattr(chat, "invite_link", "") or "").strip()
+        if invite.startswith(("https://t.me/", "https://telegram.me/")):
+            return invite
+        return None
+
+    def _group_inventory_behavior(self, chat_id: str) -> str:
+        prompts = self.config.extra.get("channel_prompts") or {}
+        prompt = str(prompts.get(chat_id, "") if isinstance(prompts, dict) else "").strip()
+        if chat_id in self._telegram_free_response_chats():
+            mode = "proactive"
+        elif self._telegram_require_mention():
+            mode = "mention/reply only"
+        else:
+            mode = "group intake enabled"
+        if not prompt:
+            return mode
+        concise = " ".join(prompt.split())
+        if len(concise) > 100:
+            concise = concise[:97].rstrip() + "..."
+        return f"{mode}; {concise}"
+
+    def _group_inventory_candidates(self, state: dict) -> list[str]:
+        candidates = set(str(chat_id) for chat_id in state["approved"])
+        allowlisted = self._telegram_allowed_chats() & self._telegram_group_allowed_chats()
+        candidates.update(
+            chat_id for chat_id in allowlisted
+            if self._is_effectively_approved_group(chat_id)
+        )
+        blocked = set(str(chat_id) for chat_id in state["rejected"])
+        blocked.update(
+            str(request.get("chat_id")) for request in state["pending"].values()
+        )
+        blocked.update(
+            str(action.get("chat_id"))
+            for action in state["leave_actions"].values()
+            if action.get("status") == "claimed"
+        )
+        return sorted(
+            chat_id for chat_id in candidates
+            if chat_id not in blocked
+            and chat_id != "*"
+            and chat_id.lstrip("-").isdigit()
+        )
+
+    async def _handle_groups_command(self, update, context) -> None:
+        """Show the configured owner a live, Bot-API-verified group inventory."""
+        message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+        owner = self._group_approval_owner_id()
+        if (
+            owner is None
+            or getattr(getattr(message, "from_user", None), "id", None) != owner
+            or getattr(getattr(message, "chat", None), "id", None) != owner
+            or str(getattr(getattr(message, "chat", None), "type", "")) != "private"
+            or not self._bot
+        ):
+            return
+        lock = getattr(self, "_group_approval_lock", None) or asyncio.Lock()
+        self._group_approval_lock = lock
+        async with lock:
+            state, readable = self._load_group_approval_state()
+            if not readable:
+                return
+            candidates = self._group_inventory_candidates(state)
+
+        live = []
+        for chat_id in candidates:
+            try:
+                chat = await self._bot.get_chat(chat_id=int(chat_id))
+                member = await self._bot.get_chat_member(
+                    chat_id=int(chat_id), user_id=self._bot.id
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Telegram] Could not verify inventory group %s: %s",
+                    chat_id, _redact_telegram_error_text(exc),
+                )
+                continue
+            status = str(getattr(member, "status", "")).lower()
+            if status not in {"member", "administrator", "creator"}:
+                continue
+            live.append((chat_id, chat, status))
+
+        if not live:
+            await self._bot.send_message(
+                chat_id=owner,
+                text="No live approved or allowlisted groups.",
+                reply_markup=None,
+            )
+            return
+
+        actions = {}
+        lines = ["Telegram groups"]
+        rows = []
+        for chat_id, chat, status in live:
+            title = str(getattr(chat, "title", "") or f"Group {chat_id}")
+            link = self._safe_group_link(chat)
+            lines.extend([
+                "",
+                title,
+                f"chat_id: {chat_id}",
+                f"bot status: {status}",
+                f"role/behavior: {self._group_inventory_behavior(chat_id)}",
+                f"link: {link or 'unavailable'}",
+            ])
+            nonce = secrets.token_urlsafe(18)
+            actions[nonce] = {
+                "chat_id": chat_id,
+                "owner_id": owner,
+                "owner_chat_id": owner,
+                "owner_message_id": None,
+                "status": "pending",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "title": title,
+            }
+            label = title if len(title) <= 35 else title[:32].rstrip() + "..."
+            rows.append([InlineKeyboardButton(f"🚪 {label}", callback_data=f"gl:{nonce}")])
+
+        async with lock:
+            state, readable = self._load_group_approval_state()
+            if not readable:
+                return
+            state["leave_actions"].update(actions)
+            self._save_group_approval_state(state)
+        sent = await self._bot.send_message(
+            chat_id=owner,
+            text="\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        message_id = getattr(sent, "message_id", None)
+        async with lock:
+            state, readable = self._load_group_approval_state()
+            if not readable:
+                return
+            for nonce in actions:
+                action = state["leave_actions"].get(nonce)
+                if action and action.get("status") == "pending":
+                    action["owner_message_id"] = message_id
+            self._save_group_approval_state(state)
+
+    def _remove_telegram_group(self, chat_id: str) -> None:
+        """Remove one exact group from every existing active routing target."""
+        from hermes_constants import get_hermes_home
+        import utils
+        path = get_hermes_home() / "config.yaml"
+
+        def mutate(document):
+            telegram = document.get("telegram")
+            platforms = document.get("platforms")
+            platform = platforms.get("telegram") if isinstance(platforms, dict) else None
+            gateway = document.get("gateway")
+            gateway_platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
+            gateway_platform = (
+                gateway_platforms.get("telegram")
+                if isinstance(gateway_platforms, dict) else None
+            )
+
+            def targets(block):
+                result = [block] if isinstance(block, dict) else []
+                if isinstance(block, dict) and isinstance(block.get("extra"), dict):
+                    result.append(block["extra"])
+                return result
+
+            root_targets = targets(telegram)
+            gateway_targets = targets(gateway_platform)
+            platform_targets = targets(platform)
+            all_targets = root_targets + gateway_targets + platform_targets
+            fields = ("allowed_chats", "group_allowed_chats", "channel_prompts")
+            active = [target for target in all_targets if any(field in target for field in fields)]
+            for target in active:
+                for field in ("allowed_chats", "group_allowed_chats"):
+                    if field in target:
+                        values = self._approval_allow_values(target.get(field))
+                        values.discard(chat_id)
+                        target[field] = ",".join(sorted(values))
+                if "channel_prompts" in target:
+                    prompts = target.get("channel_prompts")
+                    if not isinstance(prompts, dict):
+                        raise ValueError("Telegram channel_prompts must be a mapping")
+                    prompts.pop(chat_id, None)
+
+            precedence = root_targets + gateway_targets + platform_targets
+            def effective(field, default):
+                for target in precedence:
+                    if field in target:
+                        return target.get(field)
+                return default
+            allowed = self._approval_allow_values(effective("allowed_chats", None))
+            group_allowed = self._approval_allow_values(effective("group_allowed_chats", None))
+            prompts = effective("channel_prompts", {}) or {}
+            if not isinstance(prompts, dict):
+                raise ValueError("Telegram channel_prompts must be a mapping")
+            return allowed, group_allowed, dict(prompts)
+
+        allowed, group_allowed, prompts = utils.atomic_roundtrip_yaml_mutate(
+            path, mutate, lock_timeout=5.0
+        )
+        self.config.extra["allowed_chats"] = sorted(allowed)
+        self.config.extra["group_allowed_chats"] = sorted(group_allowed)
+        self.config.extra["channel_prompts"] = prompts
+        os.environ["TELEGRAM_ALLOWED_CHATS"] = ",".join(sorted(allowed))
+        os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = ",".join(sorted(group_allowed))
+
+    async def _finalize_claimed_group_leave(self, state: dict, nonce: str, action: dict) -> None:
+        chat_id = str(action["chat_id"])
+        if action.get("stage") != "config_cleaned":
+            await asyncio.to_thread(self._remove_telegram_group, chat_id)
+            action["stage"] = "config_cleaned"
+            self._save_group_approval_state(state)
+        try:
+            member = await self._bot.get_chat_member(chat_id=int(chat_id), user_id=self._bot.id)
+            status = str(getattr(member, "status", "")).lower()
+        except Exception:
+            status = "unknown"
+        if status in {"member", "administrator", "creator", "unknown"}:
+            await self._bot.leave_chat(chat_id=int(chat_id))
+        action["status"] = "completed"
+        action["completed_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_group_approval_state(state)
+
+    async def _handle_group_leave_callback(self, query, data: str) -> None:
+        owner = self._group_approval_owner_id()
+        message = getattr(query, "message", None)
+        parts = data.split(":", 1)
+        nonce = parts[1] if len(parts) == 2 else ""
+        if (
+            owner is None
+            or getattr(getattr(query, "from_user", None), "id", None) != owner
+            or getattr(message, "chat_id", None) != owner
+            or str(getattr(getattr(message, "chat", None), "type", "")) != "private"
+            or not nonce
+        ):
+            await query.answer(text="This group action has expired")
+            return
+        lock = getattr(self, "_group_approval_lock", None) or asyncio.Lock()
+        self._group_approval_lock = lock
+        async with lock:
+            state, readable = self._load_group_approval_state()
+            action = state["leave_actions"].get(nonce) if readable else None
+            if (
+                not action
+                or action.get("status") != "pending"
+                or action.get("owner_id") != owner
+                or action.get("owner_chat_id") != owner
+                or action.get("owner_message_id") != getattr(message, "message_id", None)
+            ):
+                await query.answer(text="This group action has expired")
+                return
+            chat_id = str(action["chat_id"])
+            try:
+                member = await self._bot.get_chat_member(
+                    chat_id=int(chat_id), user_id=self._bot.id
+                )
+            except Exception:
+                await query.answer(text="Could not verify group membership")
+                return
+            if str(getattr(member, "status", "")).lower() not in {
+                "member", "administrator", "creator"
+            }:
+                await query.answer(text="Bot is no longer a member of this group")
+                return
+
+            # Claim and block durably before any config or Bot API side effect.
+            action["status"] = "claimed"
+            action["claimed_at"] = datetime.now(timezone.utc).isoformat()
+            state["rejected"][chat_id] = {
+                "chat_id": chat_id,
+                "title": action.get("title"),
+                "reason": "owner_leave",
+                "rejected_at": action["claimed_at"],
+            }
+            state["approved"].pop(chat_id, None)
+            self._group_approval_synchronized.discard(chat_id)
+            self._save_group_approval_state(state)
+            try:
+                await self._finalize_claimed_group_leave(state, nonce, action)
+            except Exception as exc:
+                logger.error(
+                    "[Telegram] Owner group leave finalization failed: %s",
+                    _redact_telegram_error_text(exc),
+                )
+                self._schedule_group_approval_recovery()
+                await query.answer(text="Group blocked; leave will retry")
+                return
+        await query.answer(text="Bot left the group")
+        try:
+            await query.edit_message_text(
+                text=f"✅ Left {action.get('title') or chat_id}", reply_markup=None
+            )
+        except Exception:
+            pass
+
+    async def _handle_group_approval_callback(self, query, data: str) -> None:
+        if not self._group_approval_enabled():
+            await query.answer(text="Group approval is disabled")
+            return
+        owner = self._group_approval_owner_id()
+        message = getattr(query, "message", None)
+        if (getattr(getattr(query, "from_user", None), "id", None) != owner
+                or getattr(message, "chat_id", None) != owner
+                or str(getattr(getattr(message, "chat", None), "type", "")) != "private"):
+            await query.answer(text="⛔ Only the configured owner may decide")
+            return
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"a", "d"} or not parts[2]:
+            await query.answer(text="This group request has expired")
+            return
+        choice, nonce = parts[1], parts[2]
+        lock = getattr(self, "_group_approval_lock", None) or asyncio.Lock()
+        self._group_approval_lock = lock
+        async with lock:
+            state, readable = self._load_group_approval_state()
+            request = state["pending"].get(nonce) if readable else None
+            if (not request or request.get("decision")
+                    or request.get("owner_id") != owner
+                    or request.get("owner_chat_id") != owner
+                    or request.get("owner_message_id") != getattr(message, "message_id", None)):
+                await query.answer(text="This group request has expired")
+                return
+            chat_id = str(request["chat_id"])
+            try:
+                member = await self._bot.get_chat_member(chat_id=int(chat_id), user_id=self._bot.id)
+            except Exception:
+                await query.answer(text="Could not verify group membership")
+                return
+            if str(getattr(member, "status", "")).lower() not in {"member", "administrator"}:
+                state["pending"].pop(nonce, None)
+                self._save_group_approval_state(state)
+                await query.answer(text="Bot is no longer a member of this group")
+                return
+            prompt = self.config.extra.get("group_approval_channel_prompt")
+            if choice == "a" and not prompt:
+                await query.answer(text="Could not save group approval")
+                return
+            request["decision"] = choice
+            if choice == "a":
+                request["safety_prompt"] = str(prompt)
+            self._save_group_approval_state(state)
+            try:
+                await self._finalize_claimed_group_approval(state, nonce, request)
+            except Exception:
+                logger.exception("[Telegram] Group approval finalization failed")
+                self._schedule_group_approval_recovery()
+                await query.answer(text="Decision saved; finalization will retry")
+                return
+        await query.answer(text="Group approved" if choice == "a" else "Group denied")
+        try:
+            await query.edit_message_text(
+                text="✅ Group approved" if choice == "a" else "❌ Group denied",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -6696,12 +7484,25 @@ class TelegramAdapter(BasePlatformAdapter):
         if not query or not query.data:
             return
         data = query.data
+        if data.startswith("ga:"):
+            await self._handle_group_approval_callback(query, data)
+            return
+        if data.startswith("gl:"):
+            await self._handle_group_leave_callback(query, data)
+            return
         query_message = getattr(query, "message", None)
         query_chat_id = getattr(query_message, "chat_id", None)
         query_chat = getattr(query_message, "chat", None)
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # Stale inline cards in a pending/rejected/unsynchronized group are an
+        # ingress path too. Enrollment callbacks above are owner-private and
+        # intentionally handled before this group-level gate.
+        if query_message is not None and not self._group_approval_allows_message(query_message):
+            await query.answer(text="This group is not authorized")
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
@@ -8704,6 +9505,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
         """Return True when a group message should be stored but not dispatched."""
+        if not self._group_approval_allows_message(message):
+            return False
         if self._is_own_message(message):
             return False
         if not self._telegram_observe_unmentioned_group_messages():
@@ -9084,6 +9887,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._is_group_chat(message):
             return True
 
+        if not self._group_approval_allows_message(message):
+            return False
+
         thread_id = self._effective_message_thread_id(message)
         allowed_topics = self._telegram_allowed_topics()
         if allowed_topics:
@@ -9184,6 +9990,8 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        if not self._group_approval_allows_message(msg):
+            return
         # Early user-level auth check: reject unauthorized users before any
         # text batching, observe-buffer persistence, event building, or response
         # generation. This prevents removed/blocked users from injecting prompts
@@ -9211,6 +10019,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
+            return
+        if not self._group_approval_allows_message(msg):
             return
         if not self._should_process_message(msg, is_command=True):
             return
@@ -9245,6 +10055,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming location/venue pin messages."""
         msg = self._effective_update_message(update)
         if not msg:
+            return
+        if not self._group_approval_allows_message(msg):
             return
         if not self._is_user_authorized_from_message(msg):
             logger.warning(
@@ -9382,6 +10194,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_drop_delayed_delivery():
                 logger.debug("[Telegram] Dropping text batch flush after disconnect started")
                 return
+            if not self._group_approval_allows_source(event.source):
+                logger.debug("[Telegram] Dropping text batch after group approval changed")
+                return
             logger.info(
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
@@ -9419,6 +10234,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_drop_delayed_delivery():
                 logger.debug("[Telegram] Dropping photo batch flush after disconnect started")
                 return
+            if not self._group_approval_allows_source(event.source):
+                logger.debug("[Telegram] Dropping photo batch after group approval changed")
+                return
             logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
             await self.handle_message(event)
         finally:
@@ -9449,6 +10267,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
+            return
+        if not self._group_approval_allows_message(update.message):
             return
         if not self._is_user_authorized_from_message(update.message):
             logger.info(
@@ -9783,6 +10603,11 @@ class TelegramAdapter(BasePlatformAdapter):
             if event is not None:
                 if self._should_drop_delayed_delivery():
                     logger.debug("[Telegram] Dropping media group flush after disconnect started")
+                    return
+                if not self._group_approval_allows_source(event.source):
+                    logger.debug(
+                        "[Telegram] Dropping media group flush after group approval changed"
+                    )
                     return
                 await self.handle_message(event)
         except asyncio.CancelledError:

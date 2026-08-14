@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Union
@@ -736,6 +737,157 @@ def atomic_roundtrip_yaml_save(
         except OSError:
             pass
         raise
+
+
+_YAML_TRANSACTION_LOCKS: dict[str, threading.RLock] = {}
+_YAML_TRANSACTION_LOCKS_GUARD = threading.Lock()
+_YAML_TRANSACTION_DEPTH = threading.local()
+
+
+def _release_yaml_transaction_file_lock(handle) -> None:
+    """Release one sidecar OS lock; split out for cleanup fault injection."""
+    if os.name == "posix":
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    elif os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _acquire_yaml_transaction(path: Path, timeout: float):
+    """Acquire a bounded, per-path reentrant lock plus a sidecar OS lock."""
+    key = str(path.resolve())
+    with _YAML_TRANSACTION_LOCKS_GUARD:
+        process_lock = _YAML_TRANSACTION_LOCKS.setdefault(key, threading.RLock())
+    if not process_lock.acquire(timeout=max(0.0, timeout)):
+        raise TimeoutError(f"Timed out acquiring YAML transaction lock for {path}")
+
+    depths = getattr(_YAML_TRANSACTION_DEPTH, "paths", None)
+    if depths is None:
+        depths = {}
+        _YAML_TRANSACTION_DEPTH.paths = depths
+    if depths.get(key, 0):
+        depths[key] += 1
+        return key, process_lock, None
+
+    handle = None
+    try:
+        lock_path = path.with_name(f".{path.name}.lock")
+        handle = lock_path.open("a+", encoding="utf-8")
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                if os.name == "posix":
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                elif os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write("0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out acquiring YAML transaction lock for {path}"
+                    )
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        depths[key] = 1
+        return key, process_lock, handle
+    except BaseException:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        process_lock.release()
+        raise
+
+
+def _release_yaml_transaction(key: str, process_lock, handle) -> None:
+    depths = _YAML_TRANSACTION_DEPTH.paths
+    depth = depths.get(key, 1)
+    if depth > 1:
+        depths[key] = depth - 1
+        process_lock.release()
+        return
+    depths.pop(key, None)
+    if handle is not None:
+        try:
+            _release_yaml_transaction_file_lock(handle)
+        except Exception:
+            logger.debug("Could not explicitly unlock YAML transaction", exc_info=True)
+        finally:
+            try:
+                handle.close()
+            except Exception:
+                logger.debug("Could not close YAML transaction lock", exc_info=True)
+    process_lock.release()
+
+
+def _atomic_roundtrip_yaml_mutate_unlocked(path: Union[str, Path], mutator) -> Any:
+    """Mutate a round-trip YAML document after its transaction lock is held."""
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.allow_unicode = True
+    yaml_rt.default_flow_style = False
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+    if path.exists():
+        with path.open("r", encoding="utf-8") as handle:
+            document = yaml_rt.load(handle) or CommentedMap()
+    else:
+        document = CommentedMap()
+    if not isinstance(document, CommentedMap):
+        document = CommentedMap(document)
+    result = mutator(document)
+    original_mode = _preserve_file_mode(path)
+    original_owner = _preserve_file_owner(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.stem}_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            yaml_rt.dump(document, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        real_path = Path(atomic_replace(tmp_path, path))
+        _restore_file_owner(real_path, original_owner)
+        _restore_file_mode(real_path, original_mode)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return result
+
+
+def atomic_roundtrip_yaml_mutate(
+    path: Union[str, Path], mutator, *, lock_timeout: float = 5.0
+) -> Any:
+    """Mutate YAML under a bounded sidecar-locked read-modify-write transaction."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key, process_lock, handle = _acquire_yaml_transaction(path, lock_timeout)
+    try:
+        return _atomic_roundtrip_yaml_mutate_unlocked(path, mutator)
+    finally:
+        # Cleanup failures are intentionally suppressed so they never replace a
+        # mutation/write exception. Closing the descriptor is the final unlock.
+        _release_yaml_transaction(key, process_lock, handle)
 
 
 # ─── JSON Helpers ─────────────────────────────────────────────────────────────
