@@ -3353,8 +3353,18 @@ class SessionStore:
             self._save()
             return entry
 
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def switch_session(
+        self,
+        session_key: str,
+        target_session_id: str,
+        *,
+        expected_session_id: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
+
+        When ``expected_session_id`` is provided, the switch is an atomic
+        compare-and-swap under the routing lock. A stale caller receives
+        ``None`` and cannot overwrite a newer route decision.
 
         Used by ``/resume`` to restore a previously-named session.
         Ends the current session in SQLite (like reset), but instead of
@@ -3372,6 +3382,12 @@ class SessionStore:
                 return None
 
             old_entry = self._entries[session_key]
+
+            if (
+                expected_session_id is not None
+                and old_entry.session_id != expected_session_id
+            ):
+                return None
 
             # Don't switch if already on that session
             if old_entry.session_id == target_session_id:

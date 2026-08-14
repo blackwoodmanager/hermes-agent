@@ -7765,6 +7765,18 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Owner unfinished-task review callbacks (ur:action:key) ---
+        if data.startswith("ur:"):
+            await self._handle_unfinished_task_review_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -8217,6 +8229,448 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.edit_message_text(text=appended, reply_markup=None)
         except Exception:
             pass
+
+    async def _handle_unfinished_task_review_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Resolve an owner-only unfinished-task card action."""
+        parts = data.split(":")
+        if (
+            len(parts) != 4
+            or parts[1] not in {"c", "d", "x"}
+            or not re.fullmatch(r"[0-9a-f]{10}", parts[2])
+            or not re.fullmatch(r"[0-9a-f]{12}", parts[3])
+        ):
+            await query.answer(text="Некоректна дія")
+            return
+        action, key, action_token = parts[1], parts[2], parts[3]
+        home = _Path(os.environ.get("HERMES_HOME", str(_Path.home() / ".hermes"))).expanduser()
+        owner_raw = (
+            os.environ.get("HERMES_TASK_REVIEW_OWNER_CHAT_ID", "").strip()
+            or os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+        )
+        if not owner_raw:
+            try:
+                from dotenv import dotenv_values
+
+                values = dotenv_values(home / ".env")
+                owner_raw = str(
+                    values.get("HERMES_TASK_REVIEW_OWNER_CHAT_ID")
+                    or values.get("TELEGRAM_HOME_CHANNEL")
+                    or ""
+                ).strip()
+            except (ImportError, OSError):
+                owner_raw = ""
+        if not re.fullmatch(r"[1-9][0-9]*", owner_raw):
+            logger.error("[%s] unfinished-task review owner is not configured", self.name)
+            await query.answer(text="❌ Власника огляду не налаштовано")
+            return
+        owner_id = int(owner_raw)
+        caller_id = getattr(getattr(query, "from_user", None), "id", None)
+        chat_type_value = getattr(query_chat_type, "value", query_chat_type)
+        if (
+            caller_id != owner_id
+            or query_chat_id != owner_id
+            or str(chat_type_value or "").lower() != "private"
+            or query_thread_id is not None
+        ):
+            await query.answer(text="⛔ Ця дія доступна лише власнику")
+            return
+
+        script_path = home / "scripts" / "unfinished_task_review.py"
+        if not script_path.is_file():
+            logger.error("[%s] unfinished-task review script missing: %s", self.name, script_path)
+            await query.answer(text="❌ Обробник задач недоступний")
+            return
+
+        disposition = {"c": "open", "d": "deferred", "x": "closed"}[action]
+        message_id = getattr(getattr(query, "message", None), "message_id", None)
+        continue_context = None
+        if action == "c":
+            from gateway.session import SessionSource
+
+            try:
+                source = SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id=str(query_chat_id),
+                    chat_type="dm",
+                    user_id=str(caller_id),
+                    user_name=str(query_user_name).strip() if query_user_name else None,
+                )
+                runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+                session_store = getattr(runner, "async_session_store", None)
+                if session_store is None:
+                    raise RuntimeError("session store is unavailable")
+                current_entry = await session_store.get_or_create_session(source)
+                session_key = str(getattr(current_entry, "session_key", None) or "")
+                if not session_key:
+                    raise RuntimeError("Telegram session key is unavailable")
+                is_running = getattr(runner, "_is_session_running", None)
+                is_session_id_running = getattr(runner, "_is_session_id_running", None)
+                if not callable(is_running) or not callable(is_session_id_running):
+                    raise RuntimeError("session activity check is unavailable")
+                if is_running(session_key):
+                    await query.answer(text="⏳ Поточна дія ще виконується; спробуйте ще раз")
+                    return
+                continue_context = (
+                    source,
+                    runner,
+                    session_store,
+                    current_entry,
+                    session_key,
+                    is_running,
+                    is_session_id_running,
+                )
+            except Exception as exc:
+                logger.error("[%s] Task-review Continue preflight failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="❌ Не вдалося підготувати продовження")
+                return
+        if action == "c":
+            cmd = [
+                sys.executable,
+                str(script_path),
+                "reserve",
+                "--key",
+                key,
+                "--action-token",
+                action_token,
+                "--session-key",
+                session_key,
+            ]
+        else:
+            cmd = [
+                sys.executable,
+                str(script_path),
+                "action",
+                "--key",
+                key,
+                "--disposition",
+                disposition,
+                "--action-token",
+                action_token,
+            ]
+        proc = None
+
+        async def reconcile_ambiguous_continue_reservation() -> str:
+            """Return exact durable state after an uncertain reserve subprocess."""
+            if action != "c" or continue_context is None:
+                return "not_continue"
+            runner = continue_context[1]
+            recover_pending = getattr(
+                runner, "_recover_pending_task_review_actions", None
+            )
+            if callable(recover_pending):
+                try:
+                    if await recover_pending(only_action_token=action_token):
+                        return "pending"
+                except Exception:
+                    logger.error(
+                        "[%s] Could not recover ambiguous task-review reservation",
+                        self.name,
+                        exc_info=True,
+                    )
+
+            status_proc = None
+            try:
+                status_proc = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    str(script_path),
+                    "status",
+                    "--key",
+                    key,
+                    "--action-token",
+                    action_token,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                status_stdout, _status_stderr = await asyncio.wait_for(
+                    status_proc.communicate(), timeout=30
+                )
+                if status_proc.returncode != 0:
+                    return "unknown"
+                status_result = json.loads(status_stdout.decode("utf-8"))
+                status = str(status_result.get("status") or "")
+                if status_result.get("ok") and status in {
+                    "pending",
+                    "committed_open",
+                    "committed_other",
+                    "absent",
+                }:
+                    return status
+            except Exception:
+                if status_proc is not None and status_proc.returncode is None:
+                    try:
+                        status_proc.kill()
+                        await status_proc.communicate()
+                    except Exception:
+                        pass
+                logger.error(
+                    "[%s] Could not reconcile ambiguous task-review reservation",
+                    self.name,
+                    exc_info=True,
+                )
+            return "unknown"
+
+        async def answer_reconciled_continue_reservation() -> bool:
+            status = await reconcile_ambiguous_continue_reservation()
+            if status in {"not_continue", "absent"}:
+                return False
+            if status == "committed_other":
+                await query.answer(text="Цю дію вже виконано")
+            else:
+                await query.answer(text="⏳ Запуск ще підтверджується")
+            return True
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.communicate()
+                except Exception:
+                    pass
+            if await answer_reconciled_continue_reservation():
+                return
+            logger.error("[%s] unfinished-task callback timed out", self.name)
+            await query.answer(text="❌ Дія не виконана: таймаут")
+            return
+        except Exception as exc:
+            if await answer_reconciled_continue_reservation():
+                return
+            logger.error("[%s] unfinished-task callback failed: %s", self.name, exc, exc_info=True)
+            await query.answer(text="❌ Дія не виконана")
+            return
+
+        if proc.returncode != 0:
+            if await answer_reconciled_continue_reservation():
+                return
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+            logger.error(
+                "[%s] unfinished-task callback rc=%s: %s",
+                self.name,
+                proc.returncode,
+                stderr_text[-500:],
+            )
+            await query.answer(text="❌ Задача вже недоступна або завершена")
+            return
+        try:
+            result = json.loads(stdout_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, TypeError):
+            if await answer_reconciled_continue_reservation():
+                return
+            logger.error("[%s] unfinished-task callback returned invalid JSON", self.name)
+            await query.answer(text="❌ Некоректна відповідь обробника")
+            return
+        if not result.get("ok"):
+            await query.answer(text="❌ Дія не виконана")
+            return
+        if not result.get("applied", True):
+            await query.answer(text="Цю дію вже виконано")
+            return
+
+        if action == "c":
+            async def release_reservation() -> None:
+                try:
+                    release_proc = await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        str(script_path),
+                        "release",
+                        "--key",
+                        key,
+                        "--action-token",
+                        action_token,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(release_proc.communicate(), timeout=30)
+                except Exception:
+                    logger.error("[%s] Could not release task-review reservation", self.name, exc_info=True)
+
+            route_guard = None
+            processing_started = False
+            route_switched = False
+            original_session_id = ""
+            target_session_id = ""
+            session_store = None
+            runner = None
+            session_key = ""
+
+            async def rollback_provisional_route() -> bool:
+                if (
+                    not route_switched
+                    or session_store is None
+                    or not session_key
+                    or not original_session_id
+                    or not target_session_id
+                ):
+                    return False
+                try:
+                    restored = await session_store.switch_session(
+                        session_key,
+                        original_session_id,
+                        expected_session_id=target_session_id,
+                    )
+                    if restored is None:
+                        return False
+                    if runner is not None:
+                        clear_scope = getattr(
+                            runner, "_clear_conversation_scope", None
+                        )
+                        if callable(clear_scope):
+                            clear_scope(
+                                session_key,
+                                reason="task_review_continue_rollback",
+                            )
+                        evict_agent = getattr(runner, "_evict_cached_agent", None)
+                        if callable(evict_agent):
+                            evict_agent(session_key)
+                    return True
+                except Exception:
+                    logger.error(
+                        "[%s] Could not roll back task-review route",
+                        self.name,
+                        exc_info=True,
+                    )
+                    return False
+
+            try:
+                if continue_context is None:
+                    raise RuntimeError("Continue preflight context is unavailable")
+                (
+                    source,
+                    runner,
+                    session_store,
+                    current_entry,
+                    session_key,
+                    is_running,
+                    is_session_id_running,
+                ) = continue_context
+                outcome = result.get("outcome") if isinstance(result.get("outcome"), dict) else {}
+                title = " ".join(str(outcome.get("title") or "Незавершене завдання").split())
+                target_session_id = str(outcome.get("session_id") or "").strip()
+                session_link = str(outcome.get("session_link") or "").strip()
+                raw_items = outcome.get("items")
+                items = raw_items if isinstance(raw_items, list) else []
+                item_lines = [
+                    f"- {' '.join(str(item.get('content') or '').split())}"
+                    for item in items
+                    if isinstance(item, dict) and str(item.get("content") or "").strip()
+                ]
+                if not target_session_id:
+                    raise RuntimeError("source session is unavailable")
+                if is_running(session_key) or is_session_id_running(target_session_id):
+                    raise RuntimeError("Telegram route or source session became busy before switch")
+                active_sessions = getattr(self, "_active_sessions", None)
+                if not isinstance(active_sessions, dict):
+                    raise RuntimeError("adapter session guard registry is unavailable")
+                if session_key in active_sessions:
+                    raise RuntimeError("Telegram adapter route became busy before switch")
+                route_guard = asyncio.Event()
+                active_sessions[session_key] = route_guard
+                original_session_id = str(
+                    getattr(current_entry, "session_id", "") or ""
+                ).strip()
+                if original_session_id != target_session_id:
+                    switched = await session_store.switch_session(
+                        session_key,
+                        target_session_id,
+                        expected_session_id=original_session_id,
+                    )
+                    if switched is None:
+                        raise RuntimeError("source session switch failed")
+                    route_switched = True
+                    clear_scope = getattr(runner, "_clear_conversation_scope", None)
+                    if callable(clear_scope):
+                        clear_scope(session_key, reason="task_review_continue")
+                    evict_agent = getattr(runner, "_evict_cached_agent", None)
+                    if callable(evict_agent):
+                        evict_agent(session_key)
+                event_text = (
+                    "Користувач натиснув кнопку «Продолжить» в огляді незавершених задач.\n"
+                    "Продовжуй саме цю вже прийняту роботу з першого незавершеного кроку. "
+                    "Не перепитуй, що робити далі.\n\n"
+                    f"Задача: {title}\n"
+                    + (f"Джерело: {session_link}\n" if session_link else "")
+                    + ("Незавершені результати:\n" + "\n".join(item_lines) if item_lines else "")
+                ).rstrip()
+                event = MessageEvent(
+                    text=event_text,
+                    message_type=MessageType.TEXT,
+                    user_id=str(caller_id),
+                    user_name=str(query_user_name).strip() if query_user_name else None,
+                    source=source,
+                    raw_message=getattr(query, "message", None),
+                    message_id=f"task-review:{message_id}",
+                    reply_to_message_id=str(message_id) if message_id is not None else None,
+                    reply_to_text=getattr(getattr(query, "message", None), "text", None),
+                    metadata={"task_review_callback": True},
+                    allow_gateway_control=False,
+                )
+                acceptance = asyncio.get_running_loop().create_future()
+                setattr(event, "_task_review_key", key)
+                setattr(event, "_task_review_action_token", action_token)
+                setattr(event, "_task_review_acceptance_future", acceptance)
+                processing_started = bool(
+                    self._start_session_processing(
+                        event,
+                        session_key,
+                        interrupt_event=route_guard,
+                    )
+                )
+                if not processing_started:
+                    raise RuntimeError("source session dispatch was not scheduled")
+            except Exception as exc:
+                if route_guard is not None and not processing_started:
+                    release_guard = getattr(self, "_release_session_guard", None)
+                    if callable(release_guard):
+                        release_guard(session_key, guard=route_guard)
+                await rollback_provisional_route()
+                await release_reservation()
+                logger.error("[%s] Task-review Continue dispatch failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="❌ Не вдалося запустити продовження")
+                return
+
+            try:
+                await asyncio.wait_for(asyncio.shield(acceptance), timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Task-review Continue acceptance is still pending", self.name)
+                await query.answer(text="⏳ Запуск ще підтверджується")
+                return
+            except Exception as exc:
+                await rollback_provisional_route()
+                await release_reservation()
+                logger.error("[%s] Task-review Continue was rejected: %s", self.name, exc, exc_info=True)
+                await query.answer(text="❌ Продовження не було прийнято")
+                return
+            label = "▶️ Продовжую"
+        elif action == "d":
+            until = str(result.get("until") or "")
+            try:
+                due = datetime.fromisoformat(until)
+                label = f"⏸ Відкладено до {due.strftime('%d.%m %H:%M')}"
+            except ValueError:
+                label = "⏸ Відкладено до наступного огляду"
+        else:
+            label = "✅ Закрито"
+
+        await query.answer(text=label)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            logger.debug("[%s] Could not remove task-review keyboard", self.name, exc_info=True)
 
     def _missing_media_path_error(self, label: str, path: str) -> str:
         """Build an actionable file-not-found error for gateway MEDIA delivery.

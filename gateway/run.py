@@ -5855,9 +5855,28 @@ class TurnRunner:
                 getattr(_resume_entry, "last_resume_marked_at", None),
                 window_secs=_freshness_window,
             )
+        _resume_marker_can_recover = True
+        if _resume_entry is not None and getattr(
+            _resume_entry, "resume_pending", False
+        ):
+            _resume_reason = str(
+                getattr(_resume_entry, "resume_reason", "") or ""
+            )
+            if (
+                _resume_reason == "task_review_continue"
+                or _resume_reason.startswith("task_review_continue:")
+            ):
+                try:
+                    _resume_marker_can_recover = bool(
+                        self._runner._task_review_resume_can_schedule(_resume_entry)
+                    )
+                except Exception:
+                    _resume_marker_can_recover = False
+
         _is_resume_pending = bool(
             _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
+            and _resume_marker_can_recover
             and (_interruption_is_fresh or _resume_mark_is_fresh)
         )
         _has_fresh_tool_tail = bool(
@@ -5917,6 +5936,7 @@ class TurnRunner:
             and not ctx.message.strip()
             and _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
+            and _resume_marker_can_recover
         ):
             _sn_reason = (
                 getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
@@ -6349,6 +6369,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """True when the session holds a running-turn slot (agent or sentinel)."""
         state = self._peek_session_state(session_key)
         return state is not None and state.turn.agent is not None
+
+    def _is_session_id_running(self, session_id: str) -> bool:
+        """True when any routing alias is running the target transcript."""
+        running_keys = [key for key, _agent in self._running_agent_items()]
+        if not running_keys:
+            return False
+        try:
+            with self.session_store._lock:  # noqa: SLF001 — coherent alias snapshot
+                self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                return any(
+                    getattr(self.session_store._entries.get(key), "session_id", None)  # noqa: SLF001
+                    == session_id
+                    for key in running_keys
+                )
+        except Exception:
+            logger.warning(
+                "Could not resolve running aliases for session %s; treating as busy",
+                session_id,
+                exc_info=True,
+            )
+            return True
+
+    def _session_source_for_key(self, session_key: str) -> Optional[SessionSource]:
+        """Return the persisted route origin before any session-id rebind."""
+        try:
+            entry = self.session_store.lookup_by_session_key(session_key)
+            return getattr(entry, "origin", None)
+        except Exception:
+            logger.warning(
+                "Could not resolve route origin for %s", session_key, exc_info=True
+            )
+            return None
 
     def _running_agent_items(self) -> List[tuple]:
         """(session_key, agent) pairs for sessions with a running turn
@@ -10980,10 +11032,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
     # force-interrupted; "restart_interrupted" is set by
     # SessionStore.suspend_recently_active() on crash recovery (no
-    # .clean_shutdown marker).  All three mean "the agent was mid-turn and
-    # we killed it" — eligible for startup auto-resume.
+    # .clean_shutdown marker). These three mean "the agent was mid-turn and
+    # we killed it"; task_review_continue is a committed/recovering owner action.
+    # All are eligible for generic startup auto-resume once no adapter guard owns
+    # the route.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            "task_review_continue",
+        }
     )
 
     async def _run_startup_resume_event(
@@ -11002,6 +11061,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         returns.
         """
         try:
+            recovery_session_id = str(
+                getattr(event, "_task_review_recovery_session_id", "") or ""
+            ).strip()
+            recovery_token = str(
+                getattr(event, "_task_review_action_token", "") or ""
+            ).strip()
+            if recovery_session_id and recovery_token:
+                accepted = await self._accept_pending_task_review_for_session(
+                    recovery_session_id, session_key, recovery_token
+                )
+                if not accepted:
+                    raise RuntimeError(
+                        "task-review recovery token was not accepted"
+                    )
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -11238,6 +11311,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
+    def _task_review_resume_identity(
+        self, entry: SessionEntry
+    ) -> Optional[tuple[str, str]]:
+        """Return exact committed-open ``(token, key)`` for generic recovery."""
+        reason = str(getattr(entry, "resume_reason", "") or "")
+        prefix = "task_review_continue:"
+        if not reason.startswith(prefix):
+            return None
+        action_token = reason[len(prefix):]
+        if not re.fullmatch(r"[0-9a-f]{12}", action_token):
+            return None
+        override = os.environ.get("HERMES_TASK_REVIEW_STATE_PATH", "").strip()
+        home = Path(
+            os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        ).expanduser()
+        state_path = Path(override).expanduser() if override else (
+            home / "unfinished_task_review_state.json"
+        )
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        actions = data.get("actions", {})
+        action = actions.get(action_token) if isinstance(actions, dict) else None
+        if not isinstance(action, dict):
+            return None
+        key = str(action.get("key") or "").strip()
+        if not key or str(action.get("disposition") or "") != "open":
+            return None
+        return action_token, key
+
+    def _task_review_resume_can_schedule(self, entry: SessionEntry) -> bool:
+        """Allow generic recovery only for an exact committed-open action token."""
+        reason = str(getattr(entry, "resume_reason", "") or "")
+        if reason == "task_review_continue":
+            return False
+        if not reason.startswith("task_review_continue:"):
+            return True
+        return self._task_review_resume_identity(entry) is not None
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -11270,7 +11385,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if entry.resume_pending
                     and not entry.suspended
                     and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
+                    and (
+                        entry.resume_reason in self._AUTO_RESUME_REASONS
+                        or str(entry.resume_reason or "").startswith(
+                            "task_review_continue:"
+                        )
+                    )
                     and (platform is None or entry.origin.platform == platform)
                 ]
         except Exception as exc:
@@ -11301,9 +11421,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         now = datetime.now()
         scheduled = 0
+        claimed_session_ids: set[str] = set()
         for entry in candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
+                continue
+            if not self._task_review_resume_can_schedule(entry):
+                continue
+            task_review_identity = (
+                self._task_review_resume_identity(entry)
+                if str(entry.resume_reason or "").startswith(
+                    "task_review_continue:"
+                )
+                else None
+            )
+
+            # Route aliases can point to the same canonical transcript. Claim a
+            # session_id at most once per scheduling pass, and also reject a
+            # transcript already running through any other route alias.
+            if (
+                entry.session_id in claimed_session_ids
+                or self._is_session_id_running(entry.session_id)
+            ):
                 continue
 
             # Already being resumed (e.g. scheduled at startup and still
@@ -11319,6 +11458,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     entry.session_key,
                     getattr(source.platform, "value", source.platform),
                 )
+                continue
+            active_sessions = getattr(adapter, "_active_sessions", None)
+            if isinstance(active_sessions, dict) and entry.session_key in active_sessions:
                 continue
 
             # Validate the session owner against the current allowlist
@@ -11342,6 +11484,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
+            # Claim the canonical transcript before spawning the task so a
+            # second route alias in this same snapshot cannot enqueue a duplicate.
+            claimed_session_ids.add(entry.session_id)
+
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
             # first await (where _process_message_background sets the real
@@ -11361,6 +11507,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
             )
+            if task_review_identity is not None:
+                action_token, key = task_review_identity
+                setattr(event, "_task_review_key", key)
+                setattr(event, "_task_review_action_token", action_token)
+            else:
+                setattr(
+                    event,
+                    "_task_review_recovery_session_id",
+                    entry.session_id,
+                )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
             )
@@ -12289,6 +12445,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        await self._recover_pending_task_review_actions()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
@@ -16868,6 +17025,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Refusing new turn for session %s — external drain active.",
                 _quick_key,
             )
+            await self._reject_uncommitted_task_review(
+                event, "gateway external drain is active"
+            )
             return (
                 "⏳ This agent is draining for a maintenance action and isn't "
                 "accepting new turns right now. It'll be back in a moment — "
@@ -16890,6 +17050,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Rejecting new active session %s: max_concurrent_sessions reached",
                 _quick_key,
             )
+            await self._reject_uncommitted_task_review(
+                event, "maximum concurrent sessions reached"
+            )
             return _limit_message
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -16898,13 +17061,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _task_review_turn_succeeded = False
 
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
                 )
+                _task_review_turn_succeeded = bool(
+                    getattr(
+                        event,
+                        "_task_review_turn_completed_successfully",
+                        False,
+                    )
+                )
             except TurnLeaseTimeoutError as exc:
+                # Task-review Continue is fail-fast on alias contention. Release
+                # its durable reservation here as well as notifying any live
+                # callback waiter, so a timed-out synthetic turn never strands
+                # the action until restart.
+                if getattr(event, "_task_review_action_token", None):
+                    await self._release_unfinished_task_review_reservation(event)
+                    acceptance = getattr(
+                        event, "_task_review_acceptance_future", None
+                    )
+                    if acceptance is not None and not acceptance.done():
+                        acceptance.set_exception(exc)
                 # This is a rejected message, not a completed agent turn. Return
                 # before the /goal judge below so it cannot consume the resend
                 # notice and enqueue a synthetic continuation loop.
@@ -16963,6 +17145,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # and interrupt alike.
             self._restore_moa_one_shot(event, _quick_key)
             self._restore_pending_one_turn_model_override(_quick_key)
+            await self._reject_uncommitted_task_review(
+                event, "task-review turn exited before durable commit"
+            )
+            await self._finalize_task_review_resume_marker(
+                event, succeeded=_task_review_turn_succeeded
+            )
             # Normal completion/exception/interrupt owns and clears this exact
             # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
             # the next unclean startup's recovery pass.
@@ -17519,6 +17707,407 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         setattr(event, "_gateway_active_turn_session_key", session_key)
         setattr(event, "_gateway_active_turn_token", token)
         return True
+
+    async def _arm_task_review_resume_marker(
+        self, event: "MessageEvent", session_key: str
+    ) -> bool:
+        """Make a Continue recoverable before consuming its durable outbox row."""
+        action_token = str(
+            getattr(event, "_task_review_action_token", "") or ""
+        ).strip()
+        if not action_token:
+            return True
+        try:
+            marked = await self.async_session_store.mark_resume_pending(
+                session_key, f"task_review_continue:{action_token}"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not persist task-review resume marker for %s: %s",
+                session_key,
+                exc,
+            )
+            return False
+        if not marked:
+            return False
+        setattr(event, "_task_review_resume_marker_session_key", session_key)
+        return True
+
+    async def _finalize_task_review_resume_marker(
+        self, event: "MessageEvent", *, succeeded: bool
+    ) -> bool:
+        """Clear only terminal or definitively uncommitted Continue markers."""
+        session_key = str(
+            getattr(event, "_task_review_resume_marker_session_key", "") or ""
+        ).strip()
+        if not session_key:
+            return False
+        preserve = not succeeded and bool(
+            getattr(event, "_task_review_committed", False)
+            or getattr(event, "_task_review_commit_ambiguous", False)
+        )
+        if preserve:
+            return False
+        try:
+            cleared = await self.async_session_store.clear_resume_pending(session_key)
+        except Exception:
+            logger.warning(
+                "Could not clear task-review resume marker for %s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+        if cleared:
+            try:
+                delattr(event, "_task_review_resume_marker_session_key")
+            except AttributeError:
+                pass
+        return bool(cleared)
+
+    async def _commit_unfinished_task_review_action(self, event: "MessageEvent") -> bool:
+        """Commit a reserved Continue only after the turn is durable."""
+        key = str(getattr(event, "_task_review_key", "") or "").strip()
+        action_token = str(getattr(event, "_task_review_action_token", "") or "").strip()
+        acceptance = getattr(event, "_task_review_acceptance_future", None)
+        if not key or not action_token:
+            return True
+        home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+        script = home / "scripts" / "unfinished_task_review.py"
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(script),
+                "action",
+                "--key",
+                key,
+                "--disposition",
+                "open",
+                "--action-token",
+                action_token,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode != 0:
+                raise RuntimeError(stderr.decode("utf-8", errors="replace")[-500:])
+            result = json.loads(stdout.decode("utf-8"))
+            if not result.get("ok") or not result.get("applied"):
+                status = await self._unfinished_task_review_action_status(
+                    script, key, action_token
+                )
+                if status != "committed_open":
+                    raise RuntimeError("task-review reservation was not committed")
+        except asyncio.TimeoutError:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.communicate()
+                except Exception:
+                    pass
+            try:
+                status = await self._unfinished_task_review_action_status(
+                    script, key, action_token
+                )
+            except Exception as status_exc:
+                setattr(event, "_task_review_commit_ambiguous", True)
+                exc = RuntimeError(
+                    "task-review commit timed out and durable status could not be read"
+                )
+                if acceptance is not None and not acceptance.done():
+                    acceptance.set_exception(exc)
+                raise exc from status_exc
+            if status != "committed_open":
+                exc = RuntimeError(
+                    f"task-review commit timed out with durable status {status}"
+                )
+                if acceptance is not None and not acceptance.done():
+                    acceptance.set_exception(exc)
+                raise exc
+        except Exception as child_exc:
+            try:
+                status = await self._unfinished_task_review_action_status(
+                    script, key, action_token
+                )
+            except Exception as status_exc:
+                setattr(event, "_task_review_commit_ambiguous", True)
+                exc = RuntimeError(
+                    "task-review commit failed and durable status could not be read"
+                )
+                if acceptance is not None and not acceptance.done():
+                    acceptance.set_exception(exc)
+                raise exc from status_exc
+            if status != "committed_open":
+                exc = RuntimeError(
+                    f"task-review commit failed with durable status {status}"
+                )
+                if acceptance is not None and not acceptance.done():
+                    acceptance.set_exception(exc)
+                raise exc from child_exc
+        setattr(event, "_task_review_committed", True)
+        if acceptance is not None and not acceptance.done():
+            acceptance.set_result(True)
+        return True
+
+    async def _unfinished_task_review_action_status(
+        self, script: Path, key: str, action_token: str
+    ) -> str:
+        override = os.environ.get("HERMES_TASK_REVIEW_STATE_PATH", "").strip()
+        state_path = (
+            Path(override).expanduser()
+            if override
+            else script.parent.parent / "unfinished_task_review_state.json"
+        )
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                data = json.loads(state_path.read_text(encoding="utf-8"))
+                actions = data.get("actions", {}) if isinstance(data, dict) else {}
+                action = actions.get(action_token) if isinstance(actions, dict) else None
+                pending = data.get("pending_actions", {}) if isinstance(data, dict) else {}
+                reservation = (
+                    pending.get(action_token) if isinstance(pending, dict) else None
+                )
+                if isinstance(action, dict) and str(action.get("key") or "") == key:
+                    return (
+                        "committed_open"
+                        if str(action.get("disposition") or "") == "open"
+                        else "committed_other"
+                    )
+                if (
+                    isinstance(reservation, dict)
+                    and str(reservation.get("key") or "") == key
+                ):
+                    return "pending"
+                return "absent"
+            except FileNotFoundError:
+                return "absent"
+            except (OSError, ValueError, TypeError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.05)
+        raise RuntimeError("could not read task-review durable state") from last_error
+
+    async def _release_unfinished_task_review_reservation(
+        self, event: "MessageEvent"
+    ) -> bool:
+        key = str(getattr(event, "_task_review_key", "") or "").strip()
+        action_token = str(
+            getattr(event, "_task_review_action_token", "") or ""
+        ).strip()
+        if not key or not action_token:
+            return False
+        home = Path(
+            os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        ).expanduser()
+        script = home / "scripts" / "unfinished_task_review.py"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(script),
+                "release",
+                "--key",
+                key,
+                "--action-token",
+                action_token,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode != 0:
+                raise RuntimeError(stderr.decode("utf-8", errors="replace")[-500:])
+            return bool(json.loads(stdout.decode("utf-8")).get("released"))
+        except Exception:
+            logger.error("Could not release task-review reservation", exc_info=True)
+            return False
+
+    async def _reject_uncommitted_task_review(
+        self, event: "MessageEvent", reason: str
+    ) -> bool:
+        if (
+            not getattr(event, "_task_review_action_token", None)
+            or getattr(event, "_task_review_committed", False)
+        ):
+            return False
+        released = await self._release_unfinished_task_review_reservation(event)
+        acceptance = getattr(event, "_task_review_acceptance_future", None)
+        if acceptance is not None and not acceptance.done():
+            acceptance.set_exception(RuntimeError(reason))
+        return released
+
+    async def _recover_pending_task_review_actions(
+        self, only_action_token: Optional[str] = None
+    ) -> int:
+        """Atomically claim, rebind, and dispatch durable Continue outbox rows."""
+        home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+        script = home / "scripts" / "unfinished_task_review.py"
+        if not script.is_file():
+            return 0
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(script),
+                "pending",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode != 0:
+                raise RuntimeError(stderr.decode("utf-8", errors="replace")[-500:])
+            result = json.loads(stdout.decode("utf-8"))
+        except Exception:
+            logger.error("Could not read unfinished-task pending outbox", exc_info=True)
+            return 0
+
+        recovered = 0
+        claimed_routes: set[str] = set()
+        pending = result.get("pending", []) if isinstance(result, dict) else []
+        for record in pending if isinstance(pending, list) else []:
+            if not isinstance(record, dict):
+                continue
+            session_key = str(record.get("session_key") or "").strip()
+            session_id = str(record.get("session_id") or "").strip()
+            action_token = str(record.get("action_token") or "").strip()
+            key = str(record.get("key") or "").strip()
+            if only_action_token and action_token != only_action_token:
+                continue
+            if (
+                not session_key
+                or not session_id
+                or not action_token
+                or not key
+                or session_key in claimed_routes
+                or self._is_session_running(session_key)
+                or self._is_session_id_running(session_id)
+            ):
+                continue
+            claimed_routes.add(session_key)
+            current_route = await self.async_session_store.lookup_by_session_key(
+                session_key
+            )
+            expected_session_id = str(
+                getattr(current_route, "session_id", "") or ""
+            ).strip()
+            if not expected_session_id:
+                continue
+            source = self._session_source_for_key(session_key)
+            if source is None or source.platform != Platform.TELEGRAM:
+                continue
+            adapter = self.adapters.get(Platform.TELEGRAM)
+            active_sessions = getattr(adapter, "_active_sessions", None)
+            if adapter is None or not isinstance(active_sessions, dict):
+                continue
+            if session_key in active_sessions:
+                continue
+            route_guard = asyncio.Event()
+            active_sessions[session_key] = route_guard
+            processing_started = False
+            route_switched = False
+            try:
+                switched = await self.async_session_store.switch_session(
+                    session_key,
+                    session_id,
+                    expected_session_id=expected_session_id,
+                )
+                if switched is None:
+                    continue
+                route_switched = expected_session_id != session_id
+                self._clear_conversation_scope(
+                    session_key, reason="task_review_continue"
+                )
+                self._evict_cached_agent(session_key)
+                marked = await self.async_session_store.mark_resume_pending(
+                    session_key, f"task_review_continue:{action_token}"
+                )
+                if not marked:
+                    continue
+                event = MessageEvent(
+                    text=(
+                        "Віднови незавершену роботу після підтвердженого натискання "
+                        "«Продолжить». Продовжуй з першого незавершеного кроку; "
+                        "не перепитуй, що робити далі."
+                    ),
+                    message_type=MessageType.TEXT,
+                    user_id=str(source.user_id or ""),
+                    user_name=source.user_name,
+                    source=source,
+                    message_id=f"task-review-recovery:{action_token}",
+                    metadata={"task_review_callback": True, "task_review_recovery": True},
+                    allow_gateway_control=False,
+                )
+                setattr(event, "_task_review_key", key)
+                setattr(event, "_task_review_action_token", action_token)
+                processing_started = bool(
+                    adapter._start_session_processing(  # noqa: SLF001 — guarded internal replay
+                        event,
+                        session_key,
+                        interrupt_event=route_guard,
+                    )
+                )
+                if not processing_started:
+                    raise RuntimeError("task-review recovery dispatch was not scheduled")
+                recovered += 1
+            except Exception:
+                logger.error(
+                    "Could not recover task-review Continue for %s", session_key,
+                    exc_info=True,
+                )
+            finally:
+                if not processing_started:
+                    if route_switched:
+                        try:
+                            restored = await self.async_session_store.switch_session(
+                                session_key,
+                                expected_session_id,
+                                expected_session_id=session_id,
+                            )
+                            if restored is not None:
+                                self._clear_conversation_scope(
+                                    session_key,
+                                    reason="task_review_continue_rollback",
+                                )
+                                self._evict_cached_agent(session_key)
+                        except Exception:
+                            logger.error(
+                                "Could not roll back task-review recovery route for %s",
+                                session_key,
+                                exc_info=True,
+                            )
+                    release_guard = getattr(adapter, "_release_session_guard", None)
+                    if callable(release_guard):
+                        release_guard(session_key, guard=route_guard)
+        return recovered
+
+    async def _accept_pending_task_review_for_session(
+        self, session_id: str, session_key: str, action_token: str
+    ) -> bool:
+        """Reconcile a reserved Continue before startup auto-resume."""
+        home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+        script = home / "scripts" / "unfinished_task_review.py"
+        if not script.is_file():
+            return False
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(script),
+            "accept-pending",
+            "--session-id",
+            session_id,
+            "--session-key",
+            session_key,
+            "--action-token",
+            action_token,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(stderr.decode("utf-8", errors="replace")[-500:])
+        result = json.loads(stdout.decode("utf-8"))
+        accepted = result.get("accepted", []) if isinstance(result, dict) else []
+        return bool(result.get("ok")) and action_token in accepted
 
     async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
         """Best-effort CAS clear of the marker owned by *event*."""
@@ -18090,8 +18679,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                     owner_key=_quick_key,
                     generation=run_generation,
-                    timeout=_float_env(
-                        "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
+                    timeout=(
+                        1.0
+                        if getattr(event, "_task_review_action_token", None)
+                        else _float_env(
+                            "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
+                        )
                     ),
                 )
             except TurnLeaseTimeoutError:
@@ -18109,7 +18702,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # explicitly degraded past) the per-session lease.  Marking before the
         # await above would falsely recover an alias-routed message that never
         # began processing if the gateway died while it was still waiting.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        durable = await self._mark_durable_active_turn(event, session_entry.session_key)
+        if getattr(event, "_task_review_action_token", None):
+            if not durable:
+                raise RuntimeError("task-review continuation could not be made durable")
+            recoverable = await self._arm_task_review_resume_marker(
+                event, session_entry.session_key
+            )
+            if not recoverable:
+                raise RuntimeError(
+                    "task-review continuation recovery marker could not be persisted"
+                )
+        await self._commit_unfinished_task_review_action(event)
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -19174,13 +19778,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 await self._clear_restart_failure_count(session_key)
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception as _e:
-                    logger.debug(
-                        "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
+                if getattr(
+                    event, "_task_review_resume_marker_session_key", None
+                ):
+                    # The outer dispatch boundary clears this marker only after
+                    # every remaining persistence/send step in this method returns.
+                    setattr(
+                        event,
+                        "_task_review_agent_result_successful",
+                        True,
                     )
+                else:
+                    try:
+                        await self.async_session_store.clear_resume_pending(session_key)
+                    except Exception as _e:
+                        logger.debug(
+                            "clear_resume_pending failed for %s: %s",
+                            session_key, _e,
+                        )
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
@@ -19691,8 +20306,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                if getattr(
+                    event, "_task_review_agent_result_successful", False
+                ):
+                    setattr(
+                        event, "_task_review_turn_completed_successfully", True
+                    )
                 return None
 
+            if getattr(event, "_task_review_agent_result_successful", False):
+                setattr(event, "_task_review_turn_completed_successfully", True)
             return response
             
         except Exception as e:

@@ -26,6 +26,7 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -112,6 +113,7 @@ def _simulate_note_injection(
     *,
     agent_history: list | None = None,
     window_secs: float | None = None,
+    task_review_can_schedule: bool = True,
 ) -> str:
     """Mirror the note-injection logic in gateway/run.py _run_agent().
 
@@ -140,9 +142,17 @@ def _simulate_note_injection(
             getattr(resume_entry, "last_resume_marked_at", None),
             window_secs=window,
         )
+    resume_marker_can_recover = True
+    if resume_entry is not None and getattr(resume_entry, "resume_pending", False):
+        reason = str(getattr(resume_entry, "resume_reason", "") or "")
+        if reason == "task_review_continue" or reason.startswith(
+            "task_review_continue:"
+        ):
+            resume_marker_can_recover = task_review_can_schedule
     is_resume_pending = bool(
         resume_entry is not None
         and getattr(resume_entry, "resume_pending", False)
+        and resume_marker_can_recover
         and (interruption_is_fresh or resume_mark_is_fresh)
     )
     has_fresh_tool_tail = bool(
@@ -172,6 +182,7 @@ def _simulate_note_injection(
         and not message.strip()
         and resume_entry is not None
         and getattr(resume_entry, "resume_pending", False)
+        and resume_marker_can_recover
     ):
         sn_reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
         message = build_resume_recovery_note(sn_reason, "")
@@ -350,6 +361,29 @@ class TestResumePendingSystemNote:
         assert "[System note:" in result
         assert "gateway restart" in result
         assert "NEW message" in result
+
+    def test_tokenless_task_review_marker_does_not_affect_inbound_message(self):
+        entry = self._pending_entry(reason="task_review_continue")
+        history = [
+            {
+                "role": "assistant",
+                "content": "accepted work",
+                "timestamp": time.time(),
+            }
+        ]
+
+        assert _simulate_note_injection(
+            history,
+            "ordinary new request",
+            resume_entry=entry,
+            task_review_can_schedule=False,
+        ) == "ordinary new request"
+        assert _simulate_note_injection(
+            history,
+            "",
+            resume_entry=entry,
+            task_review_can_schedule=False,
+        ) == ""
 
 
     def test_no_resume_pending_preserves_tool_tail_note(self):
@@ -689,6 +723,168 @@ async def test_reconnect_reschedule_is_platform_scoped():
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.source == tg_source
+
+
+@pytest.mark.asyncio
+async def test_task_review_resume_waits_for_outbox_guard_then_recovers_after_crash(
+    monkeypatch, tmp_path
+):
+    runner, adapter = make_restart_runner()
+    token = "abcdef012345"
+    state_path = tmp_path / "review-state.json"
+    monkeypatch.setenv("HERMES_TASK_REVIEW_STATE_PATH", str(state_path))
+    state_path.write_text(
+        json.dumps(
+            {
+                "actions": {
+                    token: {"key": "69b6e6d7f2", "disposition": "open"}
+                },
+                "pending_actions": {},
+            }
+        )
+    )
+    source = make_restart_source(chat_id="task-review-chat")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:task-review-chat",
+        session_id="sid-task-review",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason=f"task_review_continue:{token}",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+    adapter._active_sessions[entry.session_key] = asyncio.Event()
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    adapter.handle_message.assert_not_called()
+
+    # A process crash drops in-memory guards but preserves resume_pending.
+    adapter._active_sessions.pop(entry.session_key)
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_startup_resume_deduplicates_aliases_of_same_session_id(
+    monkeypatch, tmp_path
+):
+    runner, adapter = make_restart_runner()
+    token = "abcdef012345"
+    state_path = tmp_path / "review-state.json"
+    monkeypatch.setenv("HERMES_TASK_REVIEW_STATE_PATH", str(state_path))
+    state_path.write_text(
+        json.dumps(
+            {
+                "actions": {
+                    token: {"key": "69b6e6d7f2", "disposition": "open"}
+                },
+                "pending_actions": {},
+            }
+        )
+    )
+    now = datetime.now()
+    first_source = make_restart_source(chat_id="task-review-a")
+    second_source = make_restart_source(chat_id="task-review-b")
+    first = SessionEntry(
+        session_key="agent:main:telegram:dm:task-review-a",
+        session_id="shared-task-review-session",
+        created_at=now,
+        updated_at=now,
+        origin=first_source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason=f"task_review_continue:{token}",
+        last_resume_marked_at=now,
+    )
+    second = SessionEntry(
+        session_key="agent:main:telegram:dm:task-review-b",
+        session_id="shared-task-review-session",
+        created_at=now,
+        updated_at=now,
+        origin=second_source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason=f"task_review_continue:{token}",
+        last_resume_marked_at=now,
+    )
+    runner.session_store._entries = {
+        first.session_key: first,
+        second.session_key: second,
+    }
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_task_review_resume_gate_requires_committed_open_exact_token(
+    monkeypatch, tmp_path
+):
+    runner, _adapter = make_restart_runner()
+    token = "abcdef012345"
+    now = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:task-review-gate",
+        session_id="task-review-gate-session",
+        created_at=now,
+        updated_at=now,
+        origin=make_restart_source(chat_id="task-review-gate"),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason=f"task_review_continue:{token}",
+        last_resume_marked_at=now,
+    )
+    state_path = tmp_path / "review-state.json"
+    monkeypatch.setenv("HERMES_TASK_REVIEW_STATE_PATH", str(state_path))
+    state_path.write_text(
+        json.dumps(
+            {
+                "pending_actions": {
+                    token: {
+                        "key": "69b6e6d7f2",
+                        "session_key": entry.session_key,
+                        "session_id": entry.session_id,
+                    }
+                },
+                "actions": {},
+            }
+        )
+    )
+
+    assert runner._task_review_resume_can_schedule(entry) is False
+    runner.session_store._entries = {entry.session_key: entry}
+    _adapter.handle_message = AsyncMock()
+    assert runner._schedule_resume_pending_sessions() == 0
+    _adapter.handle_message.assert_not_called()
+
+    state_path.write_text(
+        json.dumps(
+            {
+                "pending_actions": {},
+                "actions": {
+                    token: {"key": "69b6e6d7f2", "disposition": "open"}
+                },
+            }
+        )
+    )
+    assert runner._task_review_resume_can_schedule(entry) is True
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    _adapter.handle_message.assert_awaited_once()
+    event = _adapter.handle_message.await_args.args[0]
+    assert event._task_review_key == "69b6e6d7f2"
+    assert event._task_review_action_token == token
 
 
 @pytest.mark.asyncio

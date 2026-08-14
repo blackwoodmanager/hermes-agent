@@ -491,6 +491,29 @@ class TestSessionStoreSwitchSession:
         assert resumed["end_reason"] is None
         db.close()
 
+    def test_switch_session_expected_id_is_atomic_fail_closed(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        store._db = None
+        store._loaded = True
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="owner",
+            chat_type="dm",
+            user_id="owner",
+        )
+        current = store.get_or_create_session(source)
+
+        switched = store.switch_session(
+            current.session_key,
+            "rollback-target",
+            expected_session_id="stale-target",
+        )
+
+        assert switched is None
+        assert store.lookup_by_session_key(current.session_key).session_id == current.session_id
+
     def test_switch_session_rebinds_full_compression_lineage(self, tmp_path):
         from hermes_state import SessionDB
 
