@@ -763,6 +763,72 @@ class TestGatewaySystemServiceRouting:
         assert "21627" not in out  # must use the mocked budget, not live defaults
         assert "27" in out
 
+    def test_launchd_restart_external_shell_uses_graceful_sigusr1(self, monkeypatch):
+        """macOS restart must not SIGTERM an active gateway from an external shell."""
+        calls = []
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 0.0)
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 654)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda *args, **kwargs: calls.append(("terminate", args, kwargs)),
+        )
+        monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(("run", cmd)) or SimpleNamespace(returncode=0),
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert ("graceful", 654, 27.0) in calls
+        assert not any(call[0] == "terminate" for call in calls)
+        # KeepAlive may already have spawned the replacement; kickstart without
+        # -k guarantees it is running without killing that fresh process again.
+        assert ("run", ["launchctl", "kickstart", "gui/501/ai.hermes.gateway"]) in calls
+
+    def test_launchd_restart_falls_back_to_hard_restart_after_graceful_timeout(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 0.0)
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 654)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or False,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False: calls.append(("terminate", pid, force)),
+        )
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kwargs: True)
+        monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(("run", cmd)) or SimpleNamespace(returncode=0),
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert ("graceful", 654, 27.0) in calls
+        assert ("terminate", 654, False) in calls
+        assert ("run", ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.gateway"]) in calls
+
 
 
 

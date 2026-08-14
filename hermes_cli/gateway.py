@@ -4731,36 +4731,60 @@ def _wait_for_gateway_exit(
 def launchd_restart():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
-    drain_timeout = _get_restart_drain_timeout()
+    exit_wait_budget = _get_restart_exit_wait_budget()
     from gateway.status import get_running_pid
 
     try:
         pid = get_running_pid()
         if pid is not None and _request_gateway_self_restart(pid):
+            # Called from inside the gateway process tree.  Request the in-band
+            # restart asynchronously so this CLI child can return and let the
+            # current turn finish; waiting here would deadlock on that turn.
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
         if pid is not None:
-            # Announce the drain BEFORE waiting on it. This wait can run for
-            # the full drain budget (180s by default) while the old gateway
-            # finishes in-flight agent runs, and it streams into surfaces with
-            # no other feedback — the desktop updater's live output most of
-            # all, where a silent stop here reads as "update stuck" (#44515).
-            # Mirrors the systemd branch's "draining (up to Ns)..." line.
+            # External shell/update path: SIGUSR1 refuses new work and waits for
+            # active agents, cron jobs, and API runs to finish before stop().
+            # The old launchd path sent SIGTERM here; with the default 0-second
+            # stop drain that amputated every active turn immediately.
             print(
-                f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
-                f"(up to {drain_timeout:.0f}s)..."
+                f"→ Restarting gateway (PID {pid}) gracefully — waiting for "
+                f"in-flight runs (up to {exit_wait_budget:.0f}s)..."
             )
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(
-                        f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
-                    )
+            drained = _graceful_restart_via_sigusr1(pid, exit_wait_budget)
+            if drained:
+                # KeepAlive normally starts the replacement as soon as the old
+                # PID exits.  kickstart without -k is idempotent and guarantees
+                # the job is running without killing that fresh process again.
+                subprocess.run(
+                    ["launchctl", "kickstart", target], check=True, timeout=90
+                )
+                print("✓ Service restarted gracefully")
+                _clear_launchd_unsupported_marker()
+                return
+
+            print(
+                f"⚠ Gateway graceful restart timed out after "
+                f"{exit_wait_budget:.0f}s — forcing launchd restart"
+            )
+            # Re-read the tracked PID before fallback. If launchd already
+            # replaced it at the timeout boundary, never terminate the new
+            # process using the stale PID captured above.
+            remaining_pid = get_running_pid()
+            if remaining_pid is not None and remaining_pid != pid:
+                subprocess.run(
+                    ["launchctl", "kickstart", target], check=True, timeout=90
+                )
+                print("✓ Service restarted gracefully")
+                _clear_launchd_unsupported_marker()
+                return
+            if remaining_pid == pid:
+                try:
+                    terminate_pid(pid, force=False)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                _wait_for_gateway_exit(timeout=5.0, force_after=None)
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()

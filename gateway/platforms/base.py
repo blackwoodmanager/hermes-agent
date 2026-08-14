@@ -2983,13 +2983,9 @@ class BasePlatformAdapter(ABC):
     # "session restored — what next?" prompt.  The startup auto-resume turn
     # (``_schedule_resume_pending_sessions`` → the ``_is_resume_pending``
     # branch in ``_handle_message_with_agent``) reads this to pick its
-    # guidance: interactive platforms (Telegram, Slack, Discord DMs, …) get
-    # "report the restore and ask what the user wants next"; non-interactive
-    # event platforms (webhook) get "finish the interrupted work" because
-    # nobody is there to answer, and an acknowledgement would silently
-    # abandon the task (#57056).  Read generically via ``getattr(adapter,
-    # "interactive_resume", True)`` — no per-platform branching at the call
-    # site.
+    # Kept for adapter/API compatibility. Startup auto-resume now continues
+    # accepted interrupted work on every platform; interactive chats must not
+    # abandon it behind a "session restored — what next?" acknowledgement.
     interactive_resume: bool = True
 
     # Back-reference to the running ``GatewayRunner``, injected by

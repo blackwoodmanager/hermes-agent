@@ -387,7 +387,8 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
     adapter.send.assert_awaited_once_with(
         "parent-42",
-        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        "⚠️ Gateway shutting down — Your current task is checkpointed and "
+        "will resume automatically when the gateway returns.",
         metadata={"thread_id": "topic-7"},
     )
 

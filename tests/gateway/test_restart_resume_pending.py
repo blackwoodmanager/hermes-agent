@@ -313,6 +313,30 @@ class TestResumePendingSystemNote:
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
 
+    def test_empty_message_interactive_note_continues_task(self):
+        """Interactive chat auto-resume must own accepted work through restart.
+
+        Regression: Telegram's synthetic empty startup event told the model to
+        skip all unfinished work and ask ``what next?``.  The session came back,
+        but the accepted task was silently abandoned.
+        """
+        note = build_resume_recovery_note("shutdown_timeout", "", interactive=True)
+
+        assert "CONTINUE the interrupted task" in note
+        assert "ask what they would like to do next" not in note
+        assert "skip any unfinished work" not in note
+        assert "already appear in the history" in note
+        assert "verify durable state before retrying" in note
+
+    def test_new_message_does_not_silently_cancel_interrupted_work(self):
+        note = build_resume_recovery_note(
+            "shutdown_timeout", "one urgent correction", interactive=True,
+        )
+
+        assert "NEW message below FIRST" in note
+        assert "does not cancel previously accepted unfinished work" in note
+        assert "skip any unfinished work" not in note
+
 
     def test_resume_pending_fires_without_tool_tail(self):
         """Key improvement over PR #9934: the restart-resume note fires
@@ -746,8 +770,8 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
+        "⚠️ Gateway restarting — Your current task is checkpointed and "
+        "will resume automatically when the gateway returns."
     ]
 
 
