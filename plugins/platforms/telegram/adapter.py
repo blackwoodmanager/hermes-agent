@@ -6789,16 +6789,23 @@ class TelegramAdapter(BasePlatformAdapter):
         ))
 
     def _is_effectively_approved_group(self, chat_id: str) -> bool:
-        if not self._group_approval_enabled():
-            return True
+        approval_enabled = self._group_approval_enabled()
         state, readable = self._load_group_approval_state()
         if not readable:
-            return False
+            return not approval_enabled
         chat_id = str(chat_id)
         if chat_id in state["rejected"]:
             return False
         if any(str(item.get("chat_id")) == chat_id for item in state["pending"].values()):
             return False
+        if any(
+            action.get("status") == "claimed"
+            and str(action.get("chat_id")) == chat_id
+            for action in state["leave_actions"].values()
+        ):
+            return False
+        if not approval_enabled:
+            return True
         allowed = (
             chat_id in self._telegram_allowed_chats()
             and chat_id in self._telegram_group_allowed_chats()
@@ -7474,10 +7481,17 @@ class TelegramAdapter(BasePlatformAdapter):
 
             precedence = root_targets + gateway_targets + platform_targets
             def effective(field, default):
+                empty = default
                 for target in precedence:
                     if field in target:
-                        return target.get(field)
-                return default
+                        value = target.get(field)
+                        empty = value
+                        if field == "channel_prompts":
+                            if isinstance(value, dict) and value:
+                                return value
+                        elif self._approval_allow_values(value):
+                            return value
+                return empty
             allowed = self._approval_allow_values(effective("allowed_chats", None))
             group_allowed = self._approval_allow_values(effective("group_allowed_chats", None))
             prompts = effective("channel_prompts", {}) or {}

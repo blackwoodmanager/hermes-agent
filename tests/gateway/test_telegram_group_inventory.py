@@ -527,3 +527,69 @@ async def test_config_cleanup_failure_never_leaves_stale_authorization_and_retri
     recovered = json.loads((tmp_path / "telegram_group_approvals.json").read_text())
     assert recovered["leave_actions"]["secret"]["status"] == "completed"
     adapter._bot.leave_chat.assert_awaited_once_with(chat_id=CHAT)
+
+
+@pytest.mark.asyncio
+async def test_leave_claim_blocks_stale_allowlist_when_approval_feature_is_disabled(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path)
+    state = _state(tmp_path)
+    state["leave_actions"]["secret"] = {
+        "chat_id": str(CHAT), "owner_id": OWNER, "owner_chat_id": OWNER,
+        "owner_message_id": 444, "status": "pending",
+    }
+    (tmp_path / "telegram_group_approvals.json").write_text(json.dumps(state))
+    adapter = _adapter({"group_approval_enabled": False})
+    adapter._schedule_group_approval_recovery = lambda **kwargs: None
+    adapter._remove_telegram_group = lambda chat_id: (_ for _ in ()).throw(
+        OSError("locked")
+    )
+
+    await adapter._handle_group_leave_callback(_leave_query("secret"), "gl:secret")
+
+    failed = json.loads((tmp_path / "telegram_group_approvals.json").read_text())
+    assert failed["leave_actions"]["secret"]["status"] == "claimed"
+    assert str(CHAT) in failed["rejected"]
+    assert adapter._is_effectively_approved_group(str(CHAT)) is False
+    assert adapter._bot is not None
+    adapter._bot.leave_chat.assert_not_awaited()
+
+
+def test_leave_projection_ignores_empty_top_level_routing_placeholders(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "telegram": {
+                    "allowed_chats": "",
+                    "group_allowed_chats": "",
+                    "channel_prompts": {},
+                },
+                "platforms": {
+                    "telegram": {
+                        "extra": {
+                            "allowed_chats": ["-100111", str(CHAT)],
+                            "group_allowed_chats": ["-100111", str(CHAT)],
+                            "channel_prompts": {
+                                "-100111": "keep", str(CHAT): "remove"
+                            },
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter = _adapter({"group_approval_enabled": False})
+
+    projection = adapter._remove_telegram_group(str(CHAT))
+    adapter._apply_telegram_group_runtime_projection(projection)
+
+    assert adapter._telegram_allowed_chats() == {"-100111"}
+    assert adapter._telegram_group_allowed_chats() == {"-100111"}
+    assert adapter.config.extra["channel_prompts"] == {"-100111": "keep"}
