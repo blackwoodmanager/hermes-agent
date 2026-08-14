@@ -458,7 +458,7 @@ class GatewayAuthorizationMixin:
         # documented behavior matches reality
         # (website/docs/reference/environment-variables.md,
         # website/docs/user-guide/messaging/telegram.md).
-        if source.chat_type in {"group", "forum", "channel"} and source.chat_id:
+        if source.chat_type in {"group", "supergroup", "forum", "channel"} and source.chat_id:
             chat_allowlist_env = {
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
@@ -613,7 +613,7 @@ class GatewayAuthorizationMixin:
         platform_allowlist = _auth_env(platform_env_map.get(source.platform, ""))
         group_user_allowlist = ""
         group_chat_allowlist = ""
-        if source.chat_type in {"group", "forum"}:
+        if source.chat_type in {"group", "supergroup", "forum"}:
             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
             group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
@@ -646,7 +646,7 @@ class GatewayAuthorizationMixin:
                 source.platform,
                 profile=adapter_profile,
             ):
-                if source.chat_type in {"group", "forum", "channel"}:
+                if source.chat_type in {"group", "supergroup", "forum", "channel"}:
                     effective_policy = self._adapter_group_policy(
                         source.platform,
                         profile=adapter_profile,
@@ -671,7 +671,7 @@ class GatewayAuthorizationMixin:
                     # allowlist helper. Adapters without that helper keep the
                     # historical "reached the gateway under allowlist policy"
                     # rubber-stamp (#34515).
-                    if source.chat_type not in {"group", "forum", "channel"}:
+                    if source.chat_type not in {"group", "supergroup", "forum", "channel"}:
                         adapter = self._authorization_adapter(
                             source.platform,
                             profile=adapter_profile,
@@ -691,7 +691,7 @@ class GatewayAuthorizationMixin:
             adapter = self._adapter_for_source(source)
             if adapter is not None:
                 extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
-                if source.chat_type in {"group", "forum", "channel"}:
+                if source.chat_type in {"group", "supergroup", "forum", "channel"}:
                     adapter_allow = extra.get("group_allow_from")
                 else:
                     adapter_allow = extra.get("allow_from")
@@ -705,7 +705,7 @@ class GatewayAuthorizationMixin:
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
         # the sender user ID for group/forum messages.
-        if group_chat_allowlist and source.chat_type in {"group", "forum"} and source.chat_id:
+        if group_chat_allowlist and source.chat_type in {"group", "supergroup", "forum"} and source.chat_id:
             allowed_group_ids = {
                 chat_id.strip() for chat_id in group_chat_allowlist.split(",") if chat_id.strip()
             }
@@ -721,7 +721,7 @@ class GatewayAuthorizationMixin:
         if (
             source.platform == Platform.TELEGRAM
             and group_user_allowlist
-            and source.chat_type in {"group", "forum"}
+            and source.chat_type in {"group", "supergroup", "forum"}
             and source.chat_id
         ):
             legacy_chat_ids = {

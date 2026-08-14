@@ -276,6 +276,26 @@ def test_shared_group_observe_source_is_authorized_by_group_allowed_chats(monkey
     assert runner._is_user_authorized(source) is True
 
 
+def test_shared_supergroup_source_is_authorized_by_group_allowed_chats(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1004516271638",
+        chat_type="supergroup",
+        user_id="454121267",
+        user_name="Maya",
+    )
+
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-1004516271638")
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+
+    assert runner._is_user_authorized(source) is True
+
+
 class _FakeSessionEntry:
     session_id = "telegram-group-session"
 
