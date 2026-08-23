@@ -118,6 +118,38 @@ def _web_extract_url(value: Any) -> Optional[str]:
     return value or None
 
 
+# ─── YouTube ──────────────────────────────────────────────────────────────────
+
+# A YouTube watch page is a JavaScript shell. Every extract backend returns
+# the same near-empty boilerplate for it, which reads to the model as "this
+# link cannot be opened" — so it tells the user Hermes cannot do YouTube,
+# while the youtube-content skill is sitting right there with captions,
+# metadata, chapters, audio and frames. The hint below is attached to the
+# result so the model discovers the real path at the moment it would
+# otherwise give up. It is advisory text only: nothing is blocked, and the
+# extracted content is returned unchanged alongside it.
+_YOUTUBE_VIDEO_URL = re.compile(
+    r"^https?://(?:[\w-]+\.)*"
+    r"(?:youtube\.com/(?:watch\?|shorts/|live/|embed/|v/)|youtu\.be/)",
+    re.IGNORECASE,
+)
+
+YOUTUBE_EXTRACT_HINT = (
+    "This is a YouTube video. Web extraction only sees the page shell — no "
+    "transcript, chapters or description. Load the `youtube-content` skill "
+    "instead: its `youtube_media.py brief <url>` returns metadata plus the "
+    "transcript in one call, and its audio/frames subcommands cover videos "
+    "that have no captions."
+)
+
+
+def youtube_extract_hint(url: str) -> Optional[str]:
+    """Return the youtube-content pointer for a YouTube video URL, else None."""
+    if not isinstance(url, str) or not url:
+        return None
+    return YOUTUBE_EXTRACT_HINT if _YOUTUBE_VIDEO_URL.match(url.strip()) else None
+
+
 # ─── Backend Selection ────────────────────────────────────────────────────────
 
 def _env_value(name: str) -> str:
@@ -1017,6 +1049,7 @@ async def web_extract_tool(
                 "content": r.get("content", ""),
                 "error": r.get("error"),
                 **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
+                **({"hint": _hint} if (_hint := youtube_extract_hint(r.get("url", ""))) else {}),
             }
             for r in response.get("results", [])
         ]
