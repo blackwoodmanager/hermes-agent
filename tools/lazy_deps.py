@@ -270,6 +270,17 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "pyasn1==0.6.4",
     ),
     "skill.youtube": ("youtube-transcript-api==1.2.4",),
+    # yt-dlp powers skills/media/youtube-content: metadata, captions, audio
+    # for speech-to-text, video files and frame extraction. Deliberately a
+    # FLOOR, not an exact pin — the one package in this table where pinning
+    # is the bug. YouTube changes its player every few weeks, extraction
+    # breaks, and upstream ships the fix within days; an exact pin would make
+    # `hermes update` re-assert a stale version over a working one
+    # (active_features() re-installs any pin whose package is present) and
+    # leave the user with a yt-dlp that cannot open a video. The floor is the
+    # oldest release the skill is tested against. Keep in sync with
+    # YT_DLP_SPEC in skills/media/youtube-content/scripts/yt_common.py.
+    "media.yt_dlp": ("yt-dlp>=2026.7.4",),
 
     # ─── Tools ─────────────────────────────────────────────────────────────
     # ACP adapter (VS Code / Zed / JetBrains integration)

@@ -14,13 +14,30 @@ Output (JSON):
         "timestamped_text": "00:00 first line\n00:05 second line\n..."
     }
 
-Install dependency:  uv pip install youtube-transcript-api
+Two backends, tried in order:
+
+1. ``youtube-transcript-api`` — small and fast, but its single request path
+   is the one YouTube blocks hardest from datacenter IPs, which is exactly
+   where a self-hosted Hermes usually runs.
+2. ``yt-dlp`` via ``yt_common`` — more extraction routes, plus cookie and
+   proxy support, so it frequently succeeds where the first backend is
+   blocked.
+
+This script covers captions only. For metadata, chapters, audio for
+speech-to-text, video files or frames, use ``youtube_media.py``.
+
+Install dependencies:  uv pip install youtube-transcript-api yt-dlp
 """
 
 import argparse
 import json
 import re
 import sys
+from pathlib import Path
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 
 def extract_video_id(url_or_id: str) -> str:
@@ -47,30 +64,65 @@ def format_timestamp(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def fetch_transcript(video_id: str, languages: list = None):
-    """Fetch transcript segments from YouTube.
-
-    Returns a list of dicts with 'text', 'start', and 'duration' keys.
-    Compatible with youtube-transcript-api v1.x.
-    """
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-    except ImportError:
-        print("Error: youtube-transcript-api not installed. Run: uv pip install youtube-transcript-api",
-              file=sys.stderr)
-        sys.exit(1)
+def _fetch_via_transcript_api(video_id: str, languages: list = None):
+    """Fetch through youtube-transcript-api. Raises on any failure."""
+    from youtube_transcript_api import YouTubeTranscriptApi
 
     api = YouTubeTranscriptApi()
-    if languages:
-        result = api.fetch(video_id, languages=languages)
-    else:
-        result = api.fetch(video_id)
+    result = api.fetch(video_id, languages=languages) if languages else api.fetch(video_id)
 
     # v1.x returns FetchedTranscriptSnippet objects; normalize to dicts
     return [
         {"text": seg.text, "start": seg.start, "duration": seg.duration}
         for seg in result
     ]
+
+
+def _fetch_via_yt_dlp(video_id: str, languages: list = None):
+    """Fetch through yt-dlp's caption tracks. Raises YouTubeError on failure."""
+    from yt_common import (
+        YouTubeError,
+        build_ydl_opts,
+        canonical_url,
+        download_caption_track,
+        extract_info,
+        pick_caption_track,
+    )
+
+    opts = build_ydl_opts()
+    info = extract_info(canonical_url(video_id), opts)
+    track = pick_caption_track(info, languages)
+    if track is None:
+        raise YouTubeError(
+            "no_captions",
+            "This video has no captions in any language.",
+            hint="Download the audio with youtube_media.py and transcribe it "
+            "with the Hermes speech-to-text stack.",
+        )
+    return download_caption_track(track, opts)
+
+
+def fetch_transcript(video_id: str, languages: list = None):
+    """Fetch transcript segments for a video, trying both backends.
+
+    Returns a list of dicts with 'text', 'start', and 'duration' keys.
+    """
+    try:
+        return _fetch_via_transcript_api(video_id, languages)
+    except ImportError:
+        first_error = RuntimeError(
+            "youtube-transcript-api is not installed "
+            "(uv pip install youtube-transcript-api)"
+        )
+    except Exception as exc:
+        first_error = exc
+
+    try:
+        return _fetch_via_yt_dlp(video_id, languages)
+    except Exception as exc:
+        # yt-dlp's classifier produces the more actionable message of the two
+        # (bot check, geo block, no captions), so it is the one to surface.
+        raise exc from first_error
 
 
 def main():
@@ -90,6 +142,10 @@ def main():
     try:
         segments = fetch_transcript(video_id, languages)
     except Exception as e:
+        payload = getattr(e, "to_dict", None)
+        if callable(payload):
+            print(json.dumps(payload(), ensure_ascii=False))
+            sys.exit(1)
         error_msg = str(e)
         if "disabled" in error_msg.lower():
             print(json.dumps({"error": "Transcripts are disabled for this video."}))
